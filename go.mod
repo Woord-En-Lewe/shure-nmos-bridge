@@ -1,4 +1,4 @@
-module github.com/jean-pierrecoetzee/shure_nmos_gateway
+module github.com/Woord-En-Lewe/shure-nmos-bridge
 
 go 1.25.5
 

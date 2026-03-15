@@ -8,7 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/jean-pierrecoetzee/shure_nmos_gateway/internal/module"
+	"github.com/Woord-En-Lewe/shure-nmos-bridge/internal/module"
 )
 
 func main() {

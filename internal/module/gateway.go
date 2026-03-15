@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jean-pierrecoetzee/shure_nmos_gateway/internal/infrastructure"
+	"github.com/Woord-En-Lewe/shure-nmos-bridge/internal/infrastructure"
 )
 
 // Gateway defines the interface for the Shure-NMOS gateway

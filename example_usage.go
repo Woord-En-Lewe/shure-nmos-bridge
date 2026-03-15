@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/jean-pierrecoetzee/shure_nmos_gateway/internal/infrastructure"
+	"github.com/Woord-En-Lewe/shure-nmos-bridge/internal/infrastructure"
 )
 
 func main() {
