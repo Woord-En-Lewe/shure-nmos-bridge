@@ -546,6 +546,8 @@ func (c *nmosController) RegisterResource(resourceType string, resource interfac
 						slog.Debug("Updated NMOS resource", "type", resourceType, "id", id)
 						c.mu.Unlock()
 						c.broadcastUpdate(resourceType, resource)
+						// Also update in registry
+						go c.registerResourceToRegistry(resourceType, resource)
 						return nil
 					}
 				}
@@ -557,7 +559,49 @@ func (c *nmosController) RegisterResource(resourceType string, resource interfac
 	slog.Info("Registered NMOS resource", "type", resourceType)
 	c.mu.Unlock()
 	c.broadcastUpdate(resourceType, resource)
+
+	// Also register with registry
+	go c.registerResourceToRegistry(resourceType, resource)
+
 	return nil
+}
+
+// registerResourceToRegistry POSTs a resource to the NMOS registry
+func (c *nmosController) registerResourceToRegistry(resourceType string, resource interface{}) {
+	// Wrap resource in IS-04 resource envelope
+	wrapper := map[string]interface{}{
+		"type": resourceType,
+		"data": resource,
+	}
+
+	resourceJSON, err := json.Marshal(wrapper)
+	if err != nil {
+		slog.Error("Failed to marshal resource for registry", "type", resourceType, "error", err)
+		return
+	}
+
+	// POST to registry
+	req, err := http.NewRequestWithContext(context.Background(), "POST",
+		fmt.Sprintf("%s/x-nmos/registration/v1.3/resource", c.registryURL),
+		bytes.NewReader(resourceJSON))
+	if err != nil {
+		slog.Error("Failed to create registry request", "type", resourceType, "error", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		slog.Error("Failed to register resource with registry", "type", resourceType, "error", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		slog.Info("Registered resource with registry", "type", resourceType)
+	} else {
+		slog.Warn("Registry rejected resource registration", "type", resourceType, "status", resp.StatusCode)
+	}
 }
 
 // UpdateResource updates an existing NMOS resource
@@ -667,6 +711,11 @@ func (c *nmosController) GetNodes() ([]interface{}, error) {
 // SubscribeToEvents returns a channel for receiving NMOS IS-05 events
 func (c *nmosController) SubscribeToEvents() <-chan interface{} {
 	return c.eventsChan
+}
+
+// GetNodeID returns the node's unique identifier
+func (c *nmosController) GetNodeID() string {
+	return c.nodeID
 }
 
 // listenForEvents listens for NMOS IS-05 events from the registry

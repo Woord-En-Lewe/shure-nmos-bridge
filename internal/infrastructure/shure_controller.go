@@ -23,4 +23,5 @@ type NMOSController interface {
 	GetControls(deviceID string) []map[string]interface{}
 	GetNodes() ([]interface{}, error)
 	SubscribeToEvents() <-chan interface{}
+	GetNodeID() string
 }

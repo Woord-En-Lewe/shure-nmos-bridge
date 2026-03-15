@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/Woord-En-Lewe/shure-nmos-bridge/internal/infrastructure"
+	"github.com/google/uuid"
 )
 
 // Gateway defines the interface for the Shure-NMOS gateway
@@ -21,9 +21,9 @@ type Gateway interface {
 
 // shureDeviceInfo tracks an active Shure controller and its metadata
 type shureDeviceInfo struct {
-	ctrl           infrastructure.ShureController
-	lastSeen       time.Time
-	nmosDeviceIDs  map[int]string // Channel -> NMOS Device ID
+	ctrl          infrastructure.ShureController
+	lastSeen      time.Time
+	nmosDeviceIDs map[int]string // Channel -> NMOS Device ID
 }
 
 // gatewayImpl is the concrete implementation of the Gateway interface
@@ -142,7 +142,7 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		time.Sleep(500 * time.Millisecond)
 		slog.Info("Requesting full device discovery", "address", addr)
 		ctrl.SendCommand(infrastructure.GetAllCommand(0))
-		
+
 		// Set METER_RATE to 1000ms (1 second) for channel 1 to start monitoring
 		time.Sleep(100 * time.Millisecond)
 		ctrl.SendCommand(fmt.Sprintf("< SET 1 METER_RATE 01000 >\n"))
@@ -155,11 +155,11 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		"label":       dev.Instance,
 		"description": fmt.Sprintf("Axient Digital at %s", addr),
 		"tags":        map[string]interface{}{"source": dev.Info["source"]},
-		"node_id":     "00000000-0000-0000-0000-000000000000",
+		"node_id":     g.nmosCtrl.GetNodeID(),
 		"controls": []interface{}{
 			map[string]interface{}{
 				"type": "href",
-				"href": fmt.Sprintf("http://localhost:8080/x-nmos/node/v1.3/devices/%s/controls", deviceID),
+				"href": fmt.Sprintf("http://%s/x-nmos/node/v1.3/devices/%s/controls", g.nmosAddr, deviceID),
 			},
 		},
 	})
@@ -175,16 +175,16 @@ func (g *gatewayImpl) listenToShureEvents(ctx context.Context, addr string, even
 			if report, ok := ev.(*infrastructure.TPCIReport); ok {
 				// Log ALL responses for discovery debugging
 				if strings.Contains(report.Raw, "REP") {
-					slog.Debug("Axient Report Received", 
-						"address", addr, 
+					slog.Debug("Axient Report Received",
+						"address", addr,
 						"raw", report.Raw)
 				}
-				
+
 				// Log significant changes
 				if report.Param == "MODEL" || report.Param == "DEVICE_ID" || report.Param == "FW_VER" {
-					slog.Info("Axient Capability Discovered", 
-						"address", addr, 
-						"param", report.Param, 
+					slog.Info("Axient Capability Discovered",
+						"address", addr,
+						"param", report.Param,
 						"value", report.Value)
 				}
 
