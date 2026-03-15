@@ -424,6 +424,40 @@ func (c *nmosController) broadcastUpdate(resourceType string, resource interface
 	}
 }
 
+// BroadcastEvent sends an IS-07 event to all connected websocket clients
+func (c *nmosController) BroadcastEvent(source string, eventType string, data interface{}) {
+	c.mu.RLock()
+	clients := make([]*websocket.Conn, 0, len(c.clients))
+	for client := range c.clients {
+		clients = append(clients, client)
+	}
+	c.mu.RUnlock()
+
+	if len(clients) == 0 {
+		return
+	}
+
+	event := map[string]interface{}{
+		"type":       "event",
+		"source":     source,
+		"event_type": eventType,
+		"data":       data,
+		"timestamp":  time.Now().Format(time.RFC3339),
+	}
+
+	eventJSON, _ := json.Marshal(event)
+
+	for _, client := range clients {
+		if err := client.WriteMessage(websocket.TextMessage, eventJSON); err != nil {
+			slog.Error("Failed to send IS-07 event", "error", err)
+			c.mu.Lock()
+			delete(c.clients, client)
+			c.mu.Unlock()
+			client.Close()
+		}
+	}
+}
+
 // handleNodeSelf handles the /self endpoint
 func (c *nmosController) handleNodeSelf(w http.ResponseWriter, r *http.Request) {
 	host, portStr := splitHostPort(c.nodeAddr)

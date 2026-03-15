@@ -24,4 +24,5 @@ type NMOSController interface {
 	GetNodes() ([]interface{}, error)
 	SubscribeToEvents() <-chan interface{}
 	GetNodeID() string
+	BroadcastEvent(source string, eventType string, data interface{})
 }

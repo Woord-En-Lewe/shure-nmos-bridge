@@ -143,9 +143,13 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		slog.Info("Requesting full device discovery", "address", addr)
 		ctrl.SendCommand(infrastructure.GetAllCommand(0))
 
-		// Set METER_RATE to 1000ms (1 second) for channel 1 to start monitoring
+		// Set METER_RATE to 1000ms (1 second) for all channels to start periodic sampling
 		time.Sleep(100 * time.Millisecond)
-		ctrl.SendCommand(fmt.Sprintf("< SET 1 METER_RATE 01000 >\n"))
+		ctrl.SendCommand(fmt.Sprintf("< SET 0 METER_RATE 01000 >\n"))
+
+		// Start SAMPLE ALL for all channels to receive metered values
+		time.Sleep(100 * time.Millisecond)
+		ctrl.SendCommand(fmt.Sprintf("< SAMPLE 0 ALL >\n"))
 	}()
 
 	// Initial NMOS Registration (will be updated as ALL reports come in)
@@ -297,6 +301,18 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 				tags["rf_rssi_a"] = []string{vals[6]}
 				tags["rf_led_bitmap_b"] = []string{vals[7]}
 				tags["rf_rssi_b"] = []string{vals[8]}
+
+				// Broadcast IS-07 events for sampled fields
+				source := fmt.Sprintf("%s/%d", deviceID, report.Channel)
+				g.nmosCtrl.BroadcastEvent(source, "channel_quality", vals[0])
+				g.nmosCtrl.BroadcastEvent(source, "audio_led_bitmap", vals[1])
+				g.nmosCtrl.BroadcastEvent(source, "audio_peak", vals[2])
+				g.nmosCtrl.BroadcastEvent(source, "audio_rms", vals[3])
+				g.nmosCtrl.BroadcastEvent(source, "antenna_status", vals[4])
+				g.nmosCtrl.BroadcastEvent(source, "rf_led_bitmap_a", vals[5])
+				g.nmosCtrl.BroadcastEvent(source, "rf_rssi_a", vals[6])
+				g.nmosCtrl.BroadcastEvent(source, "rf_led_bitmap_b", vals[7])
+				g.nmosCtrl.BroadcastEvent(source, "rf_rssi_b", vals[8])
 			}
 		} else {
 			switch report.Param {
@@ -324,7 +340,8 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 	})
 
 	// Dynamically assign controls if this is a new parameter (Moved outside to prevent deadlock)
-	if report.Param != "" && report.Param != "ALL" {
+	// Exclude METER_RATE and SAMPLE as they are internal metering commands, not user controls
+	if report.Param != "" && report.Param != "ALL" && report.Param != "METER_RATE" {
 		g.ensureControlExists(deviceID, report.Param)
 	}
 }
@@ -364,10 +381,6 @@ func (g *gatewayImpl) ensureControlExists(deviceID string, param string) {
 		newControl["unit"] = "kHz"
 	case "CHAN_NAME":
 		newControl["name"] = "Channel Name"
-	case "METER_RATE":
-		newControl["name"] = "Meter Rate"
-		newControl["type"] = "number"
-		newControl["unit"] = "ms"
 	case "ENCRYPTION_MODE":
 		newControl["name"] = "Encryption"
 		newControl["type"] = "boolean"
