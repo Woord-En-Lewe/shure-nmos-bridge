@@ -1,4 +1,4 @@
-# Shure-NMOS Gateway
+# Shure-NMOS Bridge
 
 A high-performance gateway that bridges Shure Axient Digital wireless systems to the NMOS (Networked Media Open Specifications) ecosystem.
 
