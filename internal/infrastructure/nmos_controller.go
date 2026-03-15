@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/grandcat/zeroconf"
 )
 
 // nmosController is the concrete implementation of NMOSController
@@ -33,6 +34,12 @@ type nmosController struct {
 	// Websocket support (IS-07)
 	upgrader websocket.Upgrader
 	clients  map[*websocket.Conn]bool
+
+	// Registry discovery
+	registryResolved chan string
+	resolver         *zeroconf.Resolver
+	ctx              context.Context
+	cancel           context.CancelFunc
 }
 
 // corsMiddleware adds CORS headers to all responses
@@ -56,15 +63,19 @@ func NewNMOSController(addr string) NMOSController {
 	if addr == "" {
 		addr = "localhost:8080" // Default NMOS Node API address
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &nmosController{
-		nodeAddr:       addr,
-		registryURL:    "http://localhost:8000", // Default NMOS registry address
-		httpClient:     &http.Client{Timeout: 10 * time.Second},
-		resources:      make(map[string][]interface{}),
-		deviceControls: make(map[string][]map[string]interface{}),
-		eventsChan:     make(chan interface{}, 100),
-		done:           make(chan struct{}),
-		clients:        make(map[*websocket.Conn]bool),
+		nodeAddr:         addr,
+		registryURL:      "http://localhost:8000", // Default NMOS registry address
+		httpClient:       &http.Client{Timeout: 10 * time.Second},
+		resources:        make(map[string][]interface{}),
+		deviceControls:   make(map[string][]map[string]interface{}),
+		eventsChan:       make(chan interface{}, 100),
+		done:             make(chan struct{}),
+		clients:          make(map[*websocket.Conn]bool),
+		registryResolved: make(chan string, 1),
+		ctx:              ctx,
+		cancel:           cancel,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -88,6 +99,23 @@ func (c *nmosController) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start NMOS Node API server: %w", err)
 	}
 
+	// Start registry discovery and registration
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.discoverAndRegister(ctx)
+	}()
+
+	// Wait for registration to complete (or timeout)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.registryResolved:
+		slog.Info("NMOS node registered with registry", "registry", c.registryURL)
+	case <-time.After(30 * time.Second):
+		slog.Warn("Registry discovery timed out, continuing without registration")
+	}
+
 	// Start goroutine to handle connection lifecycle
 	c.wg.Add(1)
 	go func() {
@@ -104,6 +132,123 @@ func (c *nmosController) Start(ctx context.Context) error {
 	}()
 
 	return nil
+}
+
+// discoverAndRegister discovers NMOS registries via mDNS and registers this node
+func (c *nmosController) discoverAndRegister(ctx context.Context) {
+	// Try to discover registry via mDNS
+	registryURL, err := c.discoverRegistry(ctx)
+	if err != nil {
+		slog.Warn("Registry discovery failed, using default", "error", err)
+	} else {
+		c.registryURL = registryURL
+	}
+
+	// Build node resource
+	nodeID := "00000000-0000-0000-0000-000000000000"
+	node := c.buildNodeResource(nodeID)
+
+	// Register with registry
+	if err := c.RegisterNode(node); err != nil {
+		slog.Warn("Failed to register node with registry", "error", err)
+		return
+	}
+
+	// Signal that registration is complete
+	select {
+	case c.registryResolved <- c.registryURL:
+	default:
+	}
+}
+
+// discoverRegistry searches for an NMOS registry via mDNS
+func (c *nmosController) discoverRegistry(ctx context.Context) (string, error) {
+	resolver, err := zeroconf.NewResolver(nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create mDNS resolver: %w", err)
+	}
+
+	entries := make(chan *zeroconf.ServiceEntry)
+	done := make(chan struct{})
+
+	go func(results <-chan *zeroconf.ServiceEntry) {
+		defer close(done)
+		for entry := range results {
+			// Look for API version in TXT records
+			apiVersion := "v1.3"
+			for _, txt := range entry.Text {
+				if strings.HasPrefix(txt, "api_ver=") {
+					apiVersion = strings.TrimPrefix(txt, "api_ver=")
+					break
+				}
+			}
+
+			// Build registry URL
+			var host string
+			if len(entry.AddrIPv4) > 0 {
+				host = entry.AddrIPv4[0].String()
+			} else if len(entry.AddrIPv6) > 0 {
+				host = entry.AddrIPv6[0].String()
+			} else {
+				host = entry.HostName
+			}
+
+			registryURL := fmt.Sprintf("http://%s:%d/x-nmos/%s/", host, entry.Port, apiVersion)
+			slog.Info("Discovered NMOS registry", "url", registryURL)
+			select {
+			case entries <- entry:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}(entries)
+
+	// Browse for NMOS registration service
+	err = resolver.Browse(ctx, "_nmos-registration._tcp", "local.", entries)
+	if err != nil {
+		return "", fmt.Errorf("failed to browse for registry: %w", err)
+	}
+
+	// Wait for first registry or timeout
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-done:
+		// No entries found
+		return "", errors.New("no registries found")
+	case entry := <-entries:
+		// Found a registry
+		var host string
+		if len(entry.AddrIPv4) > 0 {
+			host = entry.AddrIPv4[0].String()
+		} else if len(entry.AddrIPv6) > 0 {
+			host = entry.AddrIPv6[0].String()
+		} else {
+			host = entry.HostName
+		}
+		return fmt.Sprintf("http://%s:%d", host, entry.Port), nil
+	}
+}
+
+// buildNodeResource creates the node resource for IS-04 registration
+func (c *nmosController) buildNodeResource(nodeID string) map[string]interface{} {
+	return map[string]interface{}{
+		"id":          nodeID,
+		"version":     fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond()),
+		"label":       "Shure-NMOS Gateway Node",
+		"description": "Gateway connecting Shure Axient to NMOS",
+		"tags":        map[string]interface{}{},
+		"caps":        map[string]interface{}{},
+		"api": map[string]interface{}{
+			"versions": []string{"v1.3"},
+			"endpoints": []map[string]interface{}{
+				{"host": c.nodeAddr, "port": 8080, "protocol": "http"},
+			},
+		},
+		"hostname":   "localhost",
+		"interfaces": []interface{}{},
+		"clocks":     []interface{}{},
+	}
 }
 
 // startServer initializes and starts the NMOS Node API HTTP server
@@ -424,9 +569,9 @@ func (c *nmosController) RegisterNode(node interface{}) error {
 		return fmt.Errorf("failed to marshal node: %w", err)
 	}
 
-	// Send POST request to NMOS IS-04 registry
+	// Send POST request to NMOS IS-04 registry (IS-04 spec: /x-nmos/registration/v1.3/resource)
 	req, err := http.NewRequestWithContext(context.Background(), "POST",
-		fmt.Sprintf("%s/nodes", c.registryURL),
+		fmt.Sprintf("%s/x-nmos/registration/v1.3/resource", c.registryURL),
 		bytes.NewReader(nodeJSON))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)

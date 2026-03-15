@@ -17,11 +17,11 @@
   - NewGateway(shureAddr, nmosAddr string) Gateway - Factory function to create a new Gateway instance
 
 ## Module: internal/infrastructure
-- **summary**: Contains infrastructure implementations for Shure Axient control protocol, NMOS IS-04/IS-05, and message passing. This layer handles all external system interactions. The Shure controller implements actual TCP/IP communication with Shure Axient devices using the TPCI command protocol. Includes builder pattern for commands, domain-specific types for parsing responses, and robust mDNS discovery using the zeroconf library for automatic device detection.
+- **summary**: Contains infrastructure implementations for Shure Axient control protocol, NMOS IS-04/IS-05, and message passing. This layer handles all external system interactions. The Shure controller implements actual TCP/IP communication with Shure Axient devices using the TPCI command protocol. Includes builder pattern for commands, domain-specific types for parsing responses, and robust mDNS discovery using the zeroconf library for automatic device detection. The NMOS controller now includes automatic registry discovery via mDNS and node self-registration per IS-04 specification.
 - **when_to_use**: Use this module when you need to understand or modify how the gateway interacts with external systems (Shure devices, NMOS registry/event systems)
 - **public_types**: 
   - ShureController - Interface for Shure Axient communication
-  - NMOSController - Interface for NMOS IS-04/IS-05 communication (added UpdateResource method and IS-07 websocket support for real-time updates)
+  - NMOSController - Interface for NMOS IS-04/IS-05 communication (added UpdateResource method and IS-07 websocket support for real-time updates, now includes automatic registry discovery and node registration)
   - MessageBus - Interface for internal message passing (defined in message_bus.go)
   - Message - Structure for messages passed between components (added Source field for origin tracking)
   - MessageType - Type definition for message categorization (defined in message_bus.go)
@@ -32,7 +32,7 @@
   - DiscoveredDevice - Representation of a discovered Shure device
 - **public_functions**: 
   - NewShureController(addr string) ShureController - Factory for Shure controller (now implements real TCP/IP communication)
-  - NewNMOSController(addr string) NMOSController - Factory for NMOS controller
+  - NewNMOSController(addr string) NMOSController - Factory for NMOS controller (now automatically discovers registries and registers the node)
   - NewInMemoryMessageBus() MessageBus - Factory for in-memory message bus
   - NewShureCommand(command string) *ShureCommandBuilder - Factory for command builder
   - ParseDeviceStatus(response string) (*DeviceStatus, error) - Parse Shure responses into domain types
