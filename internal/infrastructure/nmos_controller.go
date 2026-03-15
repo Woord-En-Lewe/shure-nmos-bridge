@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/grandcat/zeroconf"
 )
@@ -20,6 +22,7 @@ import (
 type nmosController struct {
 	registryURL    string
 	nodeAddr       string
+	nodeID         string
 	httpClient     *http.Client
 	httpServer     *http.Server
 	isRunning      bool
@@ -64,8 +67,10 @@ func NewNMOSController(addr string) NMOSController {
 		addr = "localhost:8080" // Default NMOS Node API address
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	nodeID := uuid.New().String()
 	return &nmosController{
 		nodeAddr:         addr,
+		nodeID:           nodeID,
 		registryURL:      "http://localhost:8000", // Default NMOS registry address
 		httpClient:       &http.Client{Timeout: 10 * time.Second},
 		resources:        make(map[string][]interface{}),
@@ -144,9 +149,8 @@ func (c *nmosController) discoverAndRegister(ctx context.Context) {
 		c.registryURL = registryURL
 	}
 
-	// Build node resource
-	nodeID := "00000000-0000-0000-0000-000000000000"
-	node := c.buildNodeResource(nodeID)
+	// Build node resource using the persistent node ID
+	node := c.buildNodeResource(c.nodeID)
 
 	// Register with registry
 	if err := c.RegisterNode(node); err != nil {
@@ -232,6 +236,12 @@ func (c *nmosController) discoverRegistry(ctx context.Context) (string, error) {
 
 // buildNodeResource creates the node resource for IS-04 registration
 func (c *nmosController) buildNodeResource(nodeID string) map[string]interface{} {
+	host, portStr := splitHostPort(c.nodeAddr)
+	port := 8080
+	if p, err := strconv.Atoi(portStr); err == nil {
+		port = p
+	}
+
 	return map[string]interface{}{
 		"id":          nodeID,
 		"version":     fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond()),
@@ -242,13 +252,21 @@ func (c *nmosController) buildNodeResource(nodeID string) map[string]interface{}
 		"api": map[string]interface{}{
 			"versions": []string{"v1.3"},
 			"endpoints": []map[string]interface{}{
-				{"host": c.nodeAddr, "port": 8080, "protocol": "http"},
+				{"host": host, "port": port, "protocol": "http"},
 			},
 		},
-		"hostname":   "localhost",
+		"hostname":   host,
 		"interfaces": []interface{}{},
 		"clocks":     []interface{}{},
 	}
+}
+
+// splitHostPort separates host and port from an address string
+func splitHostPort(addr string) (host, port string) {
+	if idx := strings.LastIndex(addr, ":"); idx != -1 {
+		return addr[:idx], addr[idx+1:]
+	}
+	return addr, ""
 }
 
 // startServer initializes and starts the NMOS Node API HTTP server
@@ -408,16 +426,22 @@ func (c *nmosController) broadcastUpdate(resourceType string, resource interface
 
 // handleNodeSelf handles the /self endpoint
 func (c *nmosController) handleNodeSelf(w http.ResponseWriter, r *http.Request) {
-	// Simple self representation
+	host, portStr := splitHostPort(c.nodeAddr)
+	port := 8080
+	if p, err := strconv.Atoi(portStr); err == nil {
+		port = p
+	}
+
+	// Self representation
 	self := map[string]interface{}{
-		"id":          "00000000-0000-0000-0000-000000000000",
+		"id":          c.nodeID,
 		"version":     fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond()),
 		"label":       "Shure-NMOS Gateway Node",
 		"description": "Gateway connecting Shure Axient to NMOS",
 		"tags":        map[string]interface{}{},
 		"caps":        map[string]interface{}{},
-		"api":         map[string]interface{}{"versions": []string{"v1.3"}, "endpoints": []map[string]interface{}{{"host": "localhost", "port": 8080, "protocol": "http"}}},
-		"hostname":    "localhost",
+		"api":         map[string]interface{}{"versions": []string{"v1.3"}, "endpoints": []map[string]interface{}{{"host": host, "port": port, "protocol": "http"}}},
+		"hostname":    host,
 		"interfaces":  []interface{}{},
 		"clocks":      []interface{}{},
 	}
@@ -563,16 +587,22 @@ func (c *nmosController) RegisterNode(node interface{}) error {
 		return errors.New("controller not running")
 	}
 
-	// Convert node to JSON
-	nodeJSON, err := json.Marshal(node)
+	// Wrap node in IS-04 resource envelope (type + data)
+	resource := map[string]interface{}{
+		"type": "node",
+		"data": node,
+	}
+
+	// Convert to JSON
+	resourceJSON, err := json.Marshal(resource)
 	if err != nil {
-		return fmt.Errorf("failed to marshal node: %w", err)
+		return fmt.Errorf("failed to marshal resource: %w", err)
 	}
 
 	// Send POST request to NMOS IS-04 registry (IS-04 spec: /x-nmos/registration/v1.3/resource)
 	req, err := http.NewRequestWithContext(context.Background(), "POST",
 		fmt.Sprintf("%s/x-nmos/registration/v1.3/resource", c.registryURL),
-		bytes.NewReader(nodeJSON))
+		bytes.NewReader(resourceJSON))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
