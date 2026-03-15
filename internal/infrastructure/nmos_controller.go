@@ -35,6 +35,22 @@ type nmosController struct {
 	clients  map[*websocket.Conn]bool
 }
 
+// corsMiddleware adds CORS headers to all responses
+func (c *nmosController) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 // NewNMOSController creates a new NMOSController instance
 func NewNMOSController(addr string) NMOSController {
 	if addr == "" {
@@ -43,12 +59,12 @@ func NewNMOSController(addr string) NMOSController {
 	return &nmosController{
 		nodeAddr:       addr,
 		registryURL:    "http://localhost:8000", // Default NMOS registry address
-		httpClient:      &http.Client{Timeout: 10 * time.Second},
+		httpClient:     &http.Client{Timeout: 10 * time.Second},
 		resources:      make(map[string][]interface{}),
 		deviceControls: make(map[string][]map[string]interface{}),
-		eventsChan:      make(chan interface{}, 100),
-		done:            make(chan struct{}),
-		clients:         make(map[*websocket.Conn]bool),
+		eventsChan:     make(chan interface{}, 100),
+		done:           make(chan struct{}),
+		clients:        make(map[*websocket.Conn]bool),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -94,6 +110,9 @@ func (c *nmosController) Start(ctx context.Context) error {
 func (c *nmosController) startServer() error {
 	mux := http.NewServeMux()
 
+	// Wrap mux with CORS middleware
+	corsMux := c.corsMiddleware(mux)
+
 	// Implement basic IS-04 Node API endpoints
 	mux.HandleFunc("/x-nmos/node/v1.3/", c.handleNodeRoot)
 	mux.HandleFunc("/x-nmos/node/v1.3/self/", c.handleNodeSelf)
@@ -110,7 +129,7 @@ func (c *nmosController) startServer() error {
 
 	c.httpServer = &http.Server{
 		Addr:    c.nodeAddr,
-		Handler: mux,
+		Handler: corsMux,
 	}
 
 	go func() {
@@ -246,16 +265,16 @@ func (c *nmosController) broadcastUpdate(resourceType string, resource interface
 func (c *nmosController) handleNodeSelf(w http.ResponseWriter, r *http.Request) {
 	// Simple self representation
 	self := map[string]interface{}{
-		"id":            "00000000-0000-0000-0000-000000000000",
-		"version":       fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond()),
-		"label":         "Shure-NMOS Gateway Node",
-		"description":   "Gateway connecting Shure Axient to NMOS",
-		"tags":          map[string]interface{}{},
-		"caps":          map[string]interface{}{},
-		"api":           map[string]interface{}{"versions": []string{"v1.3"}, "endpoints": []map[string]interface{}{{"host": "localhost", "port": 8080, "protocol": "http"}}},
-		"hostname":      "localhost",
-		"interfaces":    []interface{}{},
-		"clocks":        []interface{}{},
+		"id":          "00000000-0000-0000-0000-000000000000",
+		"version":     fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond()),
+		"label":       "Shure-NMOS Gateway Node",
+		"description": "Gateway connecting Shure Axient to NMOS",
+		"tags":        map[string]interface{}{},
+		"caps":        map[string]interface{}{},
+		"api":         map[string]interface{}{"versions": []string{"v1.3"}, "endpoints": []map[string]interface{}{{"host": "localhost", "port": 8080, "protocol": "http"}}},
+		"hostname":    "localhost",
+		"interfaces":  []interface{}{},
+		"clocks":      []interface{}{},
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(self)
@@ -347,7 +366,7 @@ func (c *nmosController) GetControls(deviceID string) []map[string]interface{} {
 // RegisterResource registers a device, source, etc. with the NMOS Node API
 func (c *nmosController) RegisterResource(resourceType string, resource interface{}) error {
 	c.mu.Lock()
-	
+
 	// If it's a map with an ID, check if it already exists
 	if resMap, ok := resource.(map[string]interface{}); ok {
 		if id, ok := resMap["id"].(string); ok {
