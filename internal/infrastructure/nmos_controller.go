@@ -43,6 +43,17 @@ type nmosController struct {
 	resolver         *zeroconf.Resolver
 	ctx              context.Context
 	cancel           context.CancelFunc
+
+	controlCallback func(deviceID, controlID string, value interface{})
+
+	// IS-12 NCP support
+	ncpObjects map[int]NcObject
+	ncpMu      sync.RWMutex
+
+	// mDNS advertisement
+	nodeServer   *zeroconf.Server
+	eventsServer *zeroconf.Server
+	ncpServer    *zeroconf.Server
 }
 
 // corsMiddleware adds CORS headers to all responses
@@ -68,13 +79,14 @@ func NewNMOSController(addr string) NMOSController {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	nodeID := uuid.New().String()
-	return &nmosController{
+	ctrl := &nmosController{
 		nodeAddr:         addr,
 		nodeID:           nodeID,
 		registryURL:      "http://localhost:8000", // Default NMOS registry address
 		httpClient:       &http.Client{Timeout: 10 * time.Second},
 		resources:        make(map[string][]interface{}),
 		deviceControls:   make(map[string][]map[string]interface{}),
+		ncpObjects:       make(map[int]NcObject),
 		eventsChan:       make(chan interface{}, 100),
 		done:             make(chan struct{}),
 		clients:          make(map[*websocket.Conn]bool),
@@ -89,6 +101,19 @@ func NewNMOSController(addr string) NMOSController {
 			},
 		},
 	}
+
+	// Register Root Block (OID 1)
+	rootBlock := NewNcBlock(1, nil, "Root", "Root Block")
+	ctrl.RegisterNCPObject(1, rootBlock)
+
+	// Register Class Manager (OID 3)
+	classManager := NewNcClassManager(3, nil)
+	ctrl.RegisterNCPObject(3, classManager)
+
+	// Add ClassManager to RootBlock items
+	rootBlock.Items = append(rootBlock.Items, 3)
+
+	return ctrl
 }
 
 // Start begins the NMOS controller
@@ -102,6 +127,11 @@ func (c *nmosController) Start(ctx context.Context) error {
 	// Start the Node API server
 	if err := c.startServer(); err != nil {
 		return fmt.Errorf("failed to start NMOS Node API server: %w", err)
+	}
+
+	// Start mDNS advertisement
+	if err := c.startMDNS(); err != nil {
+		slog.Warn("Failed to start mDNS advertisement", "error", err)
 	}
 
 	// Start registry discovery and registration
@@ -120,14 +150,6 @@ func (c *nmosController) Start(ctx context.Context) error {
 	case <-time.After(30 * time.Second):
 		slog.Warn("Registry discovery timed out, continuing without registration")
 	}
-
-	// Start goroutine to handle connection lifecycle
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		<-ctx.Done()
-		c.Stop(context.Background())
-	}()
 
 	// Start goroutine to listen for NMOS events (IS-05)
 	c.wg.Add(1)
@@ -290,6 +312,10 @@ func (c *nmosController) startServer() error {
 	mux.HandleFunc("/x-nmos/events/v1.0/", c.handleEventsRoot)
 	mux.HandleFunc("/x-nmos/events/v1.0/ws", c.handleWebsocket)
 
+	// Implement IS-12 NCP Websocket endpoint
+	mux.HandleFunc("/x-nmos/node/v1.3/ncp", c.handleNCP)
+	mux.HandleFunc("/x-nmos/node/v1.3/ncp/", c.handleNCP)
+
 	c.httpServer = &http.Server{
 		Addr:    c.nodeAddr,
 		Handler: corsMux,
@@ -305,6 +331,201 @@ func (c *nmosController) startServer() error {
 	return nil
 }
 
+// startMDNS advertises NMOS services via mDNS
+func (c *nmosController) startMDNS() error {
+	host, portStr := splitHostPort(c.nodeAddr)
+	port := 8080
+	if p, err := strconv.Atoi(portStr); err == nil {
+		port = p
+	}
+
+	// Advertise NMOS Node API
+	nodeServer, err := zeroconf.Register(
+		"nmos-node-"+c.nodeID,
+		"_nmos-node._tcp",
+		"local.",
+		port,
+		[]string{"api_ver=v1.3", "api_proto=http"},
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to register NMOS Node mDNS: %w", err)
+	}
+	c.nodeServer = nodeServer
+
+	// Advertise NMOS NCP (IS-12)
+	ncpServer, err := zeroconf.Register(
+		"nmos-ncp-"+c.nodeID,
+		"_nmos-ncp._tcp",
+		"local.",
+		port,
+		[]string{"api_ver=v1.0", "api_proto=ws"},
+		nil,
+	)
+	if err != nil {
+		slog.Warn("Failed to register NMOS NCP mDNS", "error", err)
+	} else {
+		c.ncpServer = ncpServer
+	}
+
+	// Advertise NMOS Events API
+	eventsServer, err := zeroconf.Register(
+		"nmos-events-"+c.nodeID,
+		"_nmos-events._tcp",
+		"local.",
+		port,
+		[]string{"api_ver=v1.0", "api_proto=http"},
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to register NMOS Events mDNS: %w", err)
+	}
+	c.eventsServer = eventsServer
+
+	slog.Info("NMOS services advertised via mDNS", "host", host, "port", port)
+	return nil
+}
+
+// RegisterNCPObject registers a control object with a specific OID
+func (c *nmosController) RegisterNCPObject(oid int, obj NcObject) {
+	c.ncpMu.Lock()
+	defer c.ncpMu.Unlock()
+	if block, ok := obj.(*NcBlock); ok {
+		block.Resolver = func(oid int) NcObject {
+			// This is safe because ncpMu is not held during GetProperty in dispatchNCPCommand
+			return c.GetNCPObject(oid)
+		}
+	}
+	c.ncpObjects[oid] = obj
+}
+
+func (c *nmosController) GetNCPObject(oid int) NcObject {
+	c.ncpMu.RLock()
+	defer c.ncpMu.RUnlock()
+	return c.ncpObjects[oid]
+}
+
+// handleNCP handles the /x-nmos/node/v1.3/ncp WebSocket endpoint
+func (c *nmosController) handleNCP(w http.ResponseWriter, r *http.Request) {
+	conn, err := c.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		slog.Error("Failed to upgrade NCP connection", "error", err)
+		return
+	}
+	defer conn.Close()
+
+	slog.Info("New NCP client connected", "remote", r.RemoteAddr)
+
+	for {
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			if !websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				slog.Error("NCP read error", "error", err)
+			}
+			break
+		}
+
+		var ncpMsg NCPMessage
+		if err := json.Unmarshal(message, &ncpMsg); err != nil {
+			slog.Warn("Failed to unmarshal NCP message", "error", err)
+			continue
+		}
+
+		if ncpMsg.MessageType == NCPMessageTypeCommand {
+			responses := make([]NCPResponse, 0, len(ncpMsg.Commands))
+			for _, cmd := range ncpMsg.Commands {
+				resp := c.dispatchNCPCommand(cmd)
+				responses = append(responses, resp)
+			}
+
+			respMsg := NCPMessage{
+				MessageType: NCPMessageTypeResponse,
+				Responses:   responses,
+			}
+
+			if err := conn.WriteJSON(respMsg); err != nil {
+				slog.Error("Failed to send NCP response", "error", err)
+				break
+			}
+		}
+	}
+}
+
+func (c *nmosController) dispatchNCPCommand(cmd NCPCommand) NCPResponse {
+	// Attempt to unmarshal arguments for property methods if needed
+	c.ncpMu.RLock()
+	obj, ok := c.ncpObjects[cmd.OID]
+	c.ncpMu.RUnlock()
+
+	if !ok {
+		return NCPResponse{
+			Handle: cmd.Handle,
+			Result: NCPMethodResult{Status: 404},
+		}
+	}
+
+	// Handle Get (1m1) and Set (1m2) as special cases for properties
+	if cmd.MethodID == NCMethodGet {
+		var args struct {
+			ID NCPPropertyID `json:"id"`
+		}
+		if err := json.Unmarshal(cmd.Arguments, &args); err != nil {
+			return NCPResponse{
+				Handle: cmd.Handle,
+				Result: NCPMethodResult{Status: 400},
+			}
+		}
+		val, err := obj.GetProperty(args.ID)
+		if err != nil {
+			return NCPResponse{
+				Handle: cmd.Handle,
+				Result: NCPMethodResult{Status: 404},
+			}
+		}
+		return NCPResponse{
+			Handle: cmd.Handle,
+			Result: NCPMethodResult{Status: 200, Value: val},
+		}
+	}
+
+	if cmd.MethodID == NCMethodSet {
+		var args struct {
+			ID    NCPPropertyID `json:"id"`
+			Value interface{}   `json:"value"`
+		}
+		if err := json.Unmarshal(cmd.Arguments, &args); err != nil {
+			return NCPResponse{
+				Handle: cmd.Handle,
+				Result: NCPMethodResult{Status: 400},
+			}
+		}
+		if err := obj.SetProperty(args.ID, args.Value); err != nil {
+			return NCPResponse{
+				Handle: cmd.Handle,
+				Result: NCPMethodResult{Status: 500},
+			}
+		}
+		return NCPResponse{
+			Handle: cmd.Handle,
+			Result: NCPMethodResult{Status: 200},
+		}
+	}
+
+	// General method invocation
+	val, err := obj.InvokeMethod(cmd.MethodID, cmd.Arguments)
+	if err != nil {
+		return NCPResponse{
+			Handle: cmd.Handle,
+			Result: NCPMethodResult{Status: 500},
+		}
+	}
+
+	return NCPResponse{
+		Handle: cmd.Handle,
+		Result: NCPMethodResult{Status: 200, Value: val},
+	}
+}
+
 // Stop halts the NMOS controller
 func (c *nmosController) Stop(ctx context.Context) error {
 	if !c.isRunning {
@@ -313,6 +534,14 @@ func (c *nmosController) Stop(ctx context.Context) error {
 
 	c.isRunning = false
 	close(c.done)
+
+	// Stop mDNS advertisement
+	if c.nodeServer != nil {
+		c.nodeServer.Shutdown()
+	}
+	if c.eventsServer != nil {
+		c.eventsServer.Shutdown()
+	}
 
 	// Gracefully shut down the HTTP server
 	if c.httpServer != nil {
@@ -342,6 +571,7 @@ func (c *nmosController) handleNodeRoot(w http.ResponseWriter, r *http.Request) 
 		"flows/",
 		"senders/",
 		"receivers/",
+		"ncp/",
 	}
 	// Note: In a full NMOS implementation, /events would be discovered via mDNS
 	// or documented at the root level if using a unified API
@@ -533,8 +763,48 @@ func (c *nmosController) handleDeviceControls(w http.ResponseWriter, r *http.Req
 	}
 	deviceID := parts[5]
 
+	if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
+		// Handle control update if a control ID is provided in the URL
+		if len(parts) >= 8 && parts[7] != "" {
+			controlID := parts[7]
+			var body struct {
+				Value interface{} `json:"value"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, "Invalid body", http.StatusBadRequest)
+				return
+			}
+
+			c.mu.RLock()
+			cb := c.controlCallback
+			c.mu.RUnlock()
+
+			if cb != nil {
+				cb(deviceID, controlID, body.Value)
+			}
+
+			// Also broadcast update as an IS-07 event
+			c.BroadcastEvent(fmt.Sprintf("%s/controls/%s", deviceID, controlID), controlID, body.Value)
+
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+	}
+
 	c.mu.RLock()
 	controls, ok := c.deviceControls[deviceID]
+	// Find device label
+	label := "Unknown Device"
+	for _, dev := range c.resources["devices"] {
+		if dMap, ok := dev.(map[string]interface{}); ok {
+			if dMap["id"] == deviceID {
+				if l, ok := dMap["label"].(string); ok {
+					label = l
+				}
+				break
+			}
+		}
+	}
 	c.mu.RUnlock()
 
 	if !ok {
@@ -549,15 +819,28 @@ func (c *nmosController) handleDeviceControls(w http.ResponseWriter, r *http.Req
 		}
 	}
 
+	// Wrap in IS-12 Control Protocol structure
+	response := map[string]interface{}{
+		"id":         deviceID,
+		"label":      label,
+		"parameters": controls,
+	}
+
 	slog.Debug("Serving controls", "deviceID", deviceID)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(controls)
+	json.NewEncoder(w).Encode(response)
 }
 
 func (c *nmosController) SetControls(deviceID string, controls []map[string]interface{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.deviceControls[deviceID] = controls
+}
+
+func (c *nmosController) OnControlChange(callback func(deviceID, controlID string, value interface{})) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.controlCallback = callback
 }
 
 func (c *nmosController) GetControls(deviceID string) []map[string]interface{} {

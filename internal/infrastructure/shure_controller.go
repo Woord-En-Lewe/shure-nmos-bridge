@@ -21,8 +21,11 @@ type NMOSController interface {
 	UpdateResource(resourceType string, id string, updateFn func(interface{}) interface{}) error
 	SetControls(deviceID string, controls []map[string]interface{})
 	GetControls(deviceID string) []map[string]interface{}
+	RegisterNCPObject(oid int, obj NcObject)
+	GetNCPObject(oid int) NcObject
 	GetNodes() ([]interface{}, error)
 	SubscribeToEvents() <-chan interface{}
 	GetNodeID() string
 	BroadcastEvent(source string, eventType string, data interface{})
+	OnControlChange(callback func(deviceID, controlID string, value interface{}))
 }

@@ -8,6 +8,14 @@
 - **public_functions**: 
   - main() - Entry point that parses flags, creates gateway, and manages lifecycle
 
+## Module: cmd/dummy_node
+- **summary**: A test utility that simulates an NMOS node with gain and fader controls
+- **when_to_use**: Use this module to test NMOS control and event handling without requiring physical Shure hardware
+- **public_types**: 
+  - None (main package)
+- **public_functions**: 
+  - main() - Entry point that initializes a dummy NMOS node with simulated controls and events
+
 ## Module: internal/module
 - **summary**: Contains the core gateway logic implementing the MIM (Module-Infrastructure-Module) pattern. This is where the business logic for translating between Shure Axient and NMOS protocols resides.
 - **when_to_use**: Use this module when you need to understand or modify the core gateway behavior and protocol translation logic

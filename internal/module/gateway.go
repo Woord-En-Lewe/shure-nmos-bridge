@@ -23,7 +23,8 @@ type Gateway interface {
 type shureDeviceInfo struct {
 	ctrl          infrastructure.ShureController
 	lastSeen      time.Time
-	nmosDeviceIDs map[int]string // Channel -> NMOS Device ID
+	nmosDeviceIDs map[int]string      // channel -> deviceID
+	parameterOIDs map[string]int      // param_key -> oid (e.g. "1_AUDIO_GAIN" -> 101)
 }
 
 // gatewayImpl is the concrete implementation of the Gateway interface
@@ -131,6 +132,7 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		ctrl:          ctrl,
 		lastSeen:      time.Now(),
 		nmosDeviceIDs: map[int]string{0: deviceID, 1: deviceID}, // Default mapping for initial discovery
+		parameterOIDs: make(map[string]int),
 	}
 	slog.Info("Connected to Shure device", "address", addr)
 
@@ -162,11 +164,28 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		"node_id":     g.nmosCtrl.GetNodeID(),
 		"controls": []interface{}{
 			map[string]interface{}{
-				"type": "href",
-				"href": fmt.Sprintf("http://%s/x-nmos/node/v1.3/devices/%s/controls", g.nmosAddr, deviceID),
+				"type": "urn:x-nmos:control:sr-ctrl/v1.0",
+				"href": fmt.Sprintf("http://%s/x-nmos/node/v1.3/devices/%s/controls/", g.nmosAddr, deviceID),
+			},
+			map[string]interface{}{
+				"type": "urn:x-nmos:control:ncp/v1.0",
+				"href": fmt.Sprintf("ws://%s/x-nmos/node/v1.3/ncp", g.nmosAddr),
 			},
 		},
 	})
+
+	// IS-12 NCP Setup
+	// Use a simple OID allocation (In a real app, this should be more robust)
+	deviceOID := 100 + len(g.shureCtrls)*10
+	devBlock := infrastructure.NewNcBlock(deviceOID, nil, "Device", dev.Instance)
+	g.nmosCtrl.RegisterNCPObject(deviceOID, devBlock)
+
+	// Add to Root Block (OID 1)
+	if root := g.nmosCtrl.GetNCPObject(1); root != nil {
+		if rb, ok := root.(*infrastructure.NcBlock); ok {
+			rb.AddItem(deviceOID)
+		}
+	}
 }
 
 // listenToShureEvents listens for events from a specific Shure controller
@@ -269,6 +288,53 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 		deviceID = info.nmosDeviceIDs[0]
 	}
 
+	// IS-12 NCP Parameter Updates
+	paramKey := fmt.Sprintf("%d_%s", report.Channel, report.Param)
+	g.mu.Lock()
+	oid, exists := info.parameterOIDs[paramKey]
+	if !exists && (report.Param == "AUDIO_GAIN" || report.Param == "MUTE") {
+		// Allocate a new OID for this parameter
+		oid = 1000 + len(info.parameterOIDs) + (len(g.shureCtrls) * 100)
+		info.parameterOIDs[paramKey] = oid
+
+		// Create Worker based on parameter type
+		var classID []int
+		if report.Param == "AUDIO_GAIN" {
+			classID = []int{1, 2, 1, 1} // Gain Worker
+		} else {
+			classID = []int{1, 2, 1, 2} // Mute Worker
+		}
+
+		worker := infrastructure.NewNcWorker(oid, classID, nil, report.Param, fmt.Sprintf("%s Channel %d", report.Param, report.Channel))
+		worker.Value = report.Value
+
+		// Set callback to send command back to Shure
+		worker.OnSet = func(val interface{}) error {
+			cmd := fmt.Sprintf("< SET %d %s %v >\n", report.Channel, report.Param, val)
+			return info.ctrl.SendCommand(cmd)
+		}
+
+		g.nmosCtrl.RegisterNCPObject(oid, worker)
+
+		// Add to Device Block
+		deviceOID := 100 + (len(g.shureCtrls)-1)*10 // Approximate device OID
+		if devObj := g.nmosCtrl.GetNCPObject(deviceOID); devObj != nil {
+			if db, ok := devObj.(*infrastructure.NcBlock); ok {
+				db.AddItem(oid)
+			}
+		}
+	}
+	g.mu.Unlock()
+
+	// Update existing worker value
+	if exists {
+		if obj := g.nmosCtrl.GetNCPObject(oid); obj != nil {
+			if worker, ok := obj.(*infrastructure.NcWorker); ok {
+				worker.Value = report.Value
+			}
+		}
+	}
+
 	if deviceID == "" {
 		return
 	}
@@ -287,9 +353,46 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 		}
 
 		// Handle different parameters
+		if report.Param == "MODEL" {
+			res["description"] = fmt.Sprintf("%s at %s", report.Value, msg.Source)
+		}
+
+		if report.Param == "DEVICE_ID" {
+			res["label"] = report.Value
+		}
+
+		// Update tags for visibility
+		tags[report.Param] = []string{fmt.Sprint(report.Value)}
+
+		// Dynamically assign controls if this is a new parameter
+		// Exclude METER_RATE and SAMPLE as they are internal metering commands, not user controls
+		if report.Param != "METER_RATE" && report.Param != "SAMPLE" && report.Param != "ALL" {
+			controls := g.nmosCtrl.GetControls(deviceID)
+			found := false
+			for _, c := range controls {
+				if c["name"] == report.Param {
+					found = true
+					break
+				}
+			}
+
+			if !found {
+				newControl := map[string]interface{}{
+					"name":  report.Param,
+					"type":  "number",
+					"value": report.Value,
+				}
+				if report.Param == "MUTE" {
+					newControl["type"] = "boolean"
+				}
+
+				controls = append(controls, newControl)
+				g.nmosCtrl.SetControls(deviceID, controls)
+			}
+		}
+
 		if strings.Contains(report.Raw, "SAMPLE") && report.Param == "ALL" {
-			// Parse sample ALL values according to documentation:
-			// qual audBitmap audPeak audRms rfAntStats rfBitmapA rfRssiA rfBitmapB rfRssiB
+			// Parse sample ALL values according to documentation
 			vals := strings.Fields(report.Value)
 			if len(vals) >= 9 {
 				tags["channel_quality"] = []string{vals[0]}
@@ -302,7 +405,7 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 				tags["rf_led_bitmap_b"] = []string{vals[7]}
 				tags["rf_rssi_b"] = []string{vals[8]}
 
-				// Broadcast IS-07 events for sampled fields
+				// Broadcast IS-07 events
 				source := fmt.Sprintf("%s/%d", deviceID, report.Channel)
 				g.nmosCtrl.BroadcastEvent(source, "channel_quality", vals[0])
 				g.nmosCtrl.BroadcastEvent(source, "audio_led_bitmap", vals[1])
@@ -314,81 +417,11 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 				g.nmosCtrl.BroadcastEvent(source, "rf_led_bitmap_b", vals[7])
 				g.nmosCtrl.BroadcastEvent(source, "rf_rssi_b", vals[8])
 			}
-		} else {
-			switch report.Param {
-			case "TX_BATT_BARS", "BATT_BARS":
-				tags["battery_bars"] = []string{report.Value}
-			case "TX_BATT_CHARGE_PERCENT", "BATT_CHARGE":
-				tags["battery_percent"] = []string{report.Value}
-			case "AUDIO_LEVEL_PEAK", "AUDIO_LVL":
-				tags["audio_peak"] = []string{report.Value}
-			case "AUDIO_LEVEL_RMS":
-				tags["audio_rms"] = []string{report.Value}
-			case "BATT_RUN_TIME":
-				tags["battery_runtime"] = []string{report.Value}
-			case "METER_RATE":
-				tags["meter_rate"] = []string{report.Value}
-			case "CHAN_NAME":
-				res["label"] = report.Value
-			case "DEVICE_ID":
-				res["label"] = report.Value
-			}
 		}
 
 		res["version"] = fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond())
 		return res
 	})
-
-	// Dynamically assign controls if this is a new parameter (Moved outside to prevent deadlock)
-	// Exclude METER_RATE and SAMPLE as they are internal metering commands, not user controls
-	if report.Param != "" && report.Param != "ALL" && report.Param != "METER_RATE" {
-		g.ensureControlExists(deviceID, report.Param)
-	}
-}
-
-// ensureControlExists adds a control to the NMOS device if it doesn't already exist
-func (g *gatewayImpl) ensureControlExists(deviceID string, param string) {
-	controls := g.nmosCtrl.GetControls(deviceID)
-	for _, c := range controls {
-		if c["parameter"] == param {
-			return
-		}
-	}
-
-	// Define standard control metadata for known parameters
-	newControl := map[string]interface{}{
-		"name":      param,
-		"parameter": param,
-		"type":      "string", // Default type
-	}
-
-	// Specialize known parameters
-	switch param {
-	case "AUDIO_GAIN":
-		newControl["name"] = "Audio Gain"
-		newControl["type"] = "number"
-		newControl["min"], newControl["max"], newControl["step"] = -18, 42, 1
-		newControl["unit"] = "dB"
-	case "AUDIO_MUTE":
-		newControl["name"] = "Audio Mute"
-		newControl["type"] = "boolean"
-	case "FLASH":
-		newControl["name"] = "Identify (Flash)"
-		newControl["type"] = "boolean"
-	case "FREQUENCY":
-		newControl["name"] = "Frequency"
-		newControl["type"] = "number"
-		newControl["unit"] = "kHz"
-	case "CHAN_NAME":
-		newControl["name"] = "Channel Name"
-	case "ENCRYPTION_MODE":
-		newControl["name"] = "Encryption"
-		newControl["type"] = "boolean"
-	}
-
-	controls = append(controls, newControl)
-	g.nmosCtrl.SetControls(deviceID, controls)
-	slog.Info("Dynamically assigned NMOS control", "deviceID", deviceID, "param", param)
 }
 
 // handleNMOSNode processes NMOS node messages and translates to Shure
