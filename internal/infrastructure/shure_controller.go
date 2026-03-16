@@ -22,6 +22,7 @@ type NMOSController interface {
 	SetControls(deviceID string, controls []map[string]interface{})
 	GetControls(deviceID string) []map[string]interface{}
 	RegisterNCPObject(oid int, obj NcObject)
+	RegisterClass(class NcClassDescriptor)
 	GetNCPObject(oid int) NcObject
 	GetNodes() ([]interface{}, error)
 	SubscribeToEvents() <-chan interface{}

@@ -175,6 +175,24 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 	})
 
 	// IS-12 NCP Setup
+	// Register custom classes if they are not already registered
+	g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+		Name:    "GainWorker",
+		ClassID: []int{1, 2, 1, 1},
+		Properties: []infrastructure.NcPropertyDescriptor{
+			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean"},
+			{Name: "gain", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcFloat32"},
+		},
+	})
+	g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+		Name:    "MuteWorker",
+		ClassID: []int{1, 2, 1, 2},
+		Properties: []infrastructure.NcPropertyDescriptor{
+			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean"},
+			{Name: "mute", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean"},
+		},
+	})
+
 	// Use a simple OID allocation (In a real app, this should be more robust)
 	deviceOID := 100 + len(g.shureCtrls)*10
 	devBlock := infrastructure.NewNcBlock(deviceOID, nil, "Device", dev.Instance)
@@ -330,7 +348,7 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 	if exists {
 		if obj := g.nmosCtrl.GetNCPObject(oid); obj != nil {
 			if worker, ok := obj.(*infrastructure.NcWorker); ok {
-				worker.Value = report.Value
+				worker.SetProperty(infrastructure.NCPPropertyID{Level: 2, Index: 1}, report.Value)
 			}
 		}
 	}

@@ -49,6 +49,8 @@ type nmosController struct {
 	// IS-12 NCP support
 	ncpObjects map[int]NcObject
 	ncpMu      sync.RWMutex
+	ncpClients map[*websocket.Conn]bool
+	ncpClientsMu sync.Mutex
 
 	// mDNS advertisement
 	nodeServer   *zeroconf.Server
@@ -87,6 +89,7 @@ func NewNMOSController(addr string) NMOSController {
 		resources:        make(map[string][]interface{}),
 		deviceControls:   make(map[string][]map[string]interface{}),
 		ncpObjects:       make(map[int]NcObject),
+		ncpClients:       make(map[*websocket.Conn]bool),
 		eventsChan:       make(chan interface{}, 100),
 		done:             make(chan struct{}),
 		clients:          make(map[*websocket.Conn]bool),
@@ -386,10 +389,43 @@ func (c *nmosController) startMDNS() error {
 	return nil
 }
 
+// BroadcastNCPNotification sends a notification to all connected NCP clients
+func (c *nmosController) BroadcastNCPNotification(oid int, eventID NCPEventID, data interface{}) {
+	c.ncpClientsMu.Lock()
+	defer c.ncpClientsMu.Unlock()
+
+	raw, err := json.Marshal(data)
+	if err != nil {
+		slog.Error("Failed to marshal NCP notification", "error", err)
+		return
+	}
+
+	msg := NCPMessage{
+		MessageType: NCPMessageTypeNotification,
+		Notifications: []NCPNotification{
+			{
+				OID:     oid,
+				EventID: eventID,
+				Data:    raw,
+			},
+		},
+	}
+
+	for conn := range c.ncpClients {
+		if err := conn.WriteJSON(msg); err != nil {
+			slog.Warn("Failed to send NCP notification to client", "error", err)
+		}
+	}
+}
+
 // RegisterNCPObject registers a control object with a specific OID
 func (c *nmosController) RegisterNCPObject(oid int, obj NcObject) {
 	c.ncpMu.Lock()
 	defer c.ncpMu.Unlock()
+
+	// Set notification callback
+	obj.SetNotifyCallback(c.BroadcastNCPNotification)
+
 	if block, ok := obj.(*NcBlock); ok {
 		block.Resolver = func(oid int) NcObject {
 			// This is safe because ncpMu is not held during GetProperty in dispatchNCPCommand
@@ -397,6 +433,17 @@ func (c *nmosController) RegisterNCPObject(oid int, obj NcObject) {
 		}
 	}
 	c.ncpObjects[oid] = obj
+}
+
+func (c *nmosController) RegisterClass(class NcClassDescriptor) {
+	c.ncpMu.RLock()
+	cm := c.ncpObjects[3]
+	c.ncpMu.RUnlock()
+
+	if manager, ok := cm.(*NcClassManager); ok {
+		key := classIDToKey(class.ClassID)
+		manager.Classes[key] = class
+	}
 }
 
 func (c *nmosController) GetNCPObject(oid int) NcObject {
@@ -412,7 +459,17 @@ func (c *nmosController) handleNCP(w http.ResponseWriter, r *http.Request) {
 		slog.Error("Failed to upgrade NCP connection", "error", err)
 		return
 	}
-	defer conn.Close()
+	
+	c.ncpClientsMu.Lock()
+	c.ncpClients[conn] = true
+	c.ncpClientsMu.Unlock()
+
+	defer func() {
+		c.ncpClientsMu.Lock()
+		delete(c.ncpClients, conn)
+		c.ncpClientsMu.Unlock()
+		conn.Close()
+	}()
 
 	slog.Info("New NCP client connected", "remote", r.RemoteAddr)
 

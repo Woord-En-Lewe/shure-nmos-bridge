@@ -101,6 +101,57 @@ type NcBlockMemberDescriptor struct {
 	Owner       *int   `json:"owner"`
 }
 
+// NcClassDescriptor describes a control class
+type NcClassDescriptor struct {
+	Description string                `json:"description,omitempty"`
+	ClassID     []int                 `json:"classId"`
+	Name        string                `json:"name"`
+	FixedRole   *string               `json:"fixedRole,omitempty"`
+	Properties  []NcPropertyDescriptor `json:"properties"`
+	Methods     []NcMethodDescriptor   `json:"methods"`
+	Events      []NcEventDescriptor    `json:"events"`
+}
+
+// NcPropertyDescriptor describes a class property
+type NcPropertyDescriptor struct {
+	Description  string `json:"description,omitempty"`
+	ID           NCPPropertyID `json:"id"`
+	Name         string `json:"name"`
+	TypeName     string `json:"typeName"`
+	IsReadOnly   bool   `json:"isReadOnly"`
+	IsNullable   bool   `json:"isNullable"`
+	IsSequence   bool   `json:"isSequence"`
+	IsDeprecated bool   `json:"isDeprecated"`
+}
+
+// NcMethodDescriptor describes a class method
+type NcMethodDescriptor struct {
+	Description    string `json:"description,omitempty"`
+	ID             NCPMethodID `json:"id"`
+	Name           string `json:"name"`
+	ResultDatatype string `json:"resultDatatype"`
+	Parameters     []NcParameterDescriptor `json:"parameters"`
+	IsDeprecated   bool   `json:"isDeprecated"`
+}
+
+// NcParameterDescriptor describes a method parameter
+type NcParameterDescriptor struct {
+	Description string `json:"description,omitempty"`
+	Name        string `json:"name"`
+	TypeName    string `json:"typeName"`
+	IsNullable  bool   `json:"isNullable"`
+	IsSequence  bool   `json:"isSequence"`
+}
+
+// NcEventDescriptor describes a class event
+type NcEventDescriptor struct {
+	Description   string `json:"description,omitempty"`
+	ID            NCPEventID `json:"id"`
+	Name          string `json:"name"`
+	EventDatatype string `json:"eventDatatype"`
+	IsDeprecated  bool   `json:"isDeprecated"`
+}
+
 // NcObject interface defines the core requirements for an NMOS Control object
 type NcObject interface {
 	GetOID() int
@@ -109,4 +160,5 @@ type NcObject interface {
 	SetProperty(id NCPPropertyID, value interface{}) error
 	InvokeMethod(id NCPMethodID, args json.RawMessage) (interface{}, error)
 	GetDescriptor() NcBlockMemberDescriptor
+	SetNotifyCallback(func(oid int, eventID NCPEventID, data interface{}))
 }

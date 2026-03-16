@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "librarian-server": {
+      "command": "/Users/jean-pierrecoetzee/Documents/Library/mcp-librarian/librarian-server",
+      "args": [
+        "--root=/Users/jean-pierrecoetzee/Documents/Library"
+      ]
+    }
+  }
+}

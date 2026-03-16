@@ -52,6 +52,21 @@ func main() {
 	})
 
 	// IS-12 NCP Setup for Dummy Device
+	nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+		Name:    "GainWorker",
+		ClassID: []int{1, 2, 1, 1},
+		Properties: []infrastructure.NcPropertyDescriptor{
+			{Name: "gain", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcFloat32"},
+		},
+	})
+	nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+		Name:    "FaderWorker",
+		ClassID: []int{1, 2, 1, 2},
+		Properties: []infrastructure.NcPropertyDescriptor{
+			{Name: "fader", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcFloat32"},
+		},
+	})
+
 	deviceOID := 100
 	devBlock := infrastructure.NewNcBlock(deviceOID, nil, "Device", "Dummy Device")
 	nmosCtrl.RegisterNCPObject(deviceOID, devBlock)
@@ -114,6 +129,17 @@ func main() {
 		if devID == deviceID {
 			slog.Info("Control Change Received", "control", ctrlID, "value", value)
 			
+			// Update NCP objects if they match
+			if ctrlID == "gain" {
+				if obj := nmosCtrl.GetNCPObject(101); obj != nil {
+					obj.SetProperty(infrastructure.NCPPropertyID{Level: 2, Index: 1}, value)
+				}
+			} else if ctrlID == "fader" {
+				if obj := nmosCtrl.GetNCPObject(102); obj != nil {
+					obj.SetProperty(infrastructure.NCPPropertyID{Level: 2, Index: 1}, value)
+				}
+			}
+
 			// Update the control's value in the parameters list
 			params := nmosCtrl.GetControls(devID)
 			for i, p := range params {
