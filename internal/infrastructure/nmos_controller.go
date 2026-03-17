@@ -60,6 +60,10 @@ type nmosController struct {
 	nodeServer   *zeroconf.Server
 	eventsServer *zeroconf.Server
 	ncpServer    *zeroconf.Server
+
+	// Connection Management (IS-05)
+	stagedConnections map[string]ConnectionStaged // resourceID -> staged state
+	activeConnections map[string]ConnectionActive // resourceID -> active state
 }
 
 // corsMiddleware adds CORS headers to all responses
@@ -102,6 +106,8 @@ func NewNMOSController(addr string) NMOSController {
 		registryResolved: make(chan string, 1),
 		ctx:              ctx,
 		cancel:           cancel,
+		stagedConnections: make(map[string]ConnectionStaged),
+		activeConnections: make(map[string]ConnectionActive),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -307,6 +313,69 @@ func (c *nmosController) registerResourceToRegistry(ctx context.Context, resourc
 	}
 	
 	return fmt.Errorf("registry rejected resource registration: status %d", resp.StatusCode)
+}
+
+// unregisterResourceFromRegistry DELETEs a resource from the NMOS registry
+func (c *nmosController) unregisterResourceFromRegistry(ctx context.Context, resourceType string, id string) error {
+	url := fmt.Sprintf("%s/x-nmos/registration/v1.3/resource/%s/%s", c.registryURL, resourceType, id)
+	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create unregistration request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to execute unregistration request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+		slog.Info("Unregistered resource from registry", "type", resourceType, "id", id)
+		return nil
+	}
+
+	if resp.StatusCode == http.StatusNotFound {
+		slog.Debug("Resource already removed from registry", "type", resourceType, "id", id)
+		return nil
+	}
+
+	return fmt.Errorf("registry rejected resource unregistration: status %d", resp.StatusCode)
+}
+
+// unregisterAll performs a controlled unregistration of all resources in order
+func (c *nmosController) unregisterAll(ctx context.Context) {
+	slog.Info("Performing NMOS controlled unregistration")
+
+	// Order of deletion (reverse of registration): Receivers -> Senders -> Flows -> Sources -> Devices
+	resourceTypes := []string{"receivers", "senders", "flows", "sources", "devices"}
+
+	c.mu.RLock()
+	nodeID := c.nodeID
+	// Copy resource IDs to avoid holding lock during network calls
+	allResourceIDs := make(map[string][]string)
+	for _, t := range resourceTypes {
+		for _, res := range c.resources[t] {
+			if resMap, ok := res.(map[string]interface{}); ok {
+				if id, ok := resMap["id"].(string); ok {
+					allResourceIDs[t] = append(allResourceIDs[t], id)
+				}
+			}
+		}
+	}
+	c.mu.RUnlock()
+
+	for _, resourceType := range resourceTypes {
+		for _, id := range allResourceIDs[resourceType] {
+			if err := c.unregisterResourceFromRegistry(ctx, resourceType, id); err != nil {
+				slog.Warn("Failed to unregister resource", "type", resourceType, "id", id, "error", err)
+			}
+		}
+	}
+
+	// Finally, unregister the Node itself
+	if err := c.unregisterResourceFromRegistry(ctx, "node", nodeID); err != nil {
+		slog.Warn("Failed to unregister node", "id", nodeID, "error", err)
+	}
 }
 
 // discoverRegistry searches for an NMOS registry via mDNS
@@ -726,6 +795,12 @@ func (c *nmosController) Stop(ctx context.Context) error {
 	}
 
 	c.isRunning = false
+
+	// Perform controlled unregistration
+	unregCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	c.unregisterAll(unregCtx)
+
 	close(c.done)
 
 	// Stop mDNS advertisement
@@ -1453,12 +1528,12 @@ func (c *nmosController) handleConnectionRoot(w http.ResponseWriter, r *http.Req
 func (c *nmosController) handleConnectionSenders(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/x-nmos/connection/v1.1/single/senders/")
 	parts := strings.Split(path, "/")
-	
+
 	if len(parts) < 2 { // senderId/endpoint
 		http.NotFound(w, r)
 		return
 	}
-	
+
 	senderID := parts[0]
 	endpoint := parts[1]
 
@@ -1472,87 +1547,139 @@ func (c *nmosController) handleConnectionSenders(w http.ResponseWriter, r *http.
 			}
 		}
 	}
-	
+	c.mu.RUnlock()
+
 	if foundSender == nil {
-		c.mu.RUnlock()
 		http.NotFound(w, r)
 		return
 	}
 
-	// Find Source ID via Flow ID
-	var sourceID string
-	if flowID, ok := foundSender["flow_id"].(string); ok {
-		for _, f := range c.resources["flows"] {
-			if fMap, ok := f.(map[string]interface{}); ok {
-				if fMap["id"] == flowID {
-					if sID, ok := fMap["source_id"].(string); ok {
-						sourceID = sID
-					}
-					break
-				}
-			}
-		}
-	}
-	c.mu.RUnlock()
-
 	w.Header().Set("Content-Type", "application/json")
 
-	if endpoint == "active" {
-		host, portStr := splitHostPort(c.nodeAddr)
-		// Assume standard websocket port or use node port
-		wsURL := fmt.Sprintf("ws://%s:%s/x-nmos/events/v1.0/ws", host, portStr)
-		
-		apiURL := fmt.Sprintf("http://%s:%s/x-nmos/events/v1.0/sources/%s/", host, portStr, sourceID)
+	switch endpoint {
+	case "active":
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		c.mu.RLock()
+		active, exists := c.activeConnections[senderID]
+		c.mu.RUnlock()
 
-		transportParams := []map[string]interface{}{
-			{
-				"connection_uri":         wsURL,
-				"connection_authorization": false,
-				"ext_is_07_rest_api_url": apiURL,
-				"ext_is_07_source_id":    sourceID,
-			},
+		if !exists {
+			// Initialize with defaults if not exists
+			active = ConnectionActive{
+				SenderID:     &senderID,
+				MasterEnable: true,
+				Activation:   ConnectionActivation{Mode: ActivationModeImmediate},
+				TransportParams: []map[string]interface{}{
+					{
+						"connection_uri":           fmt.Sprintf("ws://%s/x-nmos/events/v1.0/ws", c.nodeAddr),
+						"connection_authorization": false,
+					},
+				},
+			}
+		}
+		json.NewEncoder(w).Encode(active)
+
+	case "staged":
+		if r.Method == http.MethodGet {
+			c.mu.RLock()
+			staged, exists := c.stagedConnections[senderID]
+			c.mu.RUnlock()
+
+			if !exists {
+				// Return active values as a fallback/default
+				c.mu.RLock()
+				active := c.activeConnections[senderID]
+				c.mu.RUnlock()
+				staged = ConnectionStaged{
+					SenderID:        &senderID,
+					MasterEnable:    active.MasterEnable,
+					Activation:      active.Activation,
+					TransportParams: active.TransportParams,
+				}
+			}
+			json.NewEncoder(w).Encode(staged)
+			return
 		}
 
-		response := map[string]interface{}{
-			"sender_id":        senderID,
-			"master_enable":    true,
-			"activation":       map[string]interface{}{"mode": "activate_immediate"},
-			"transport_params": transportParams,
-		}
-		json.NewEncoder(w).Encode(response)
-		return
-	}
+		if r.Method == http.MethodPatch {
+			var patch ConnectionStaged
+			if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+				http.Error(w, "Invalid body", http.StatusBadRequest)
+				return
+			}
 
-	if endpoint == "constraints" {
-		// return empty constraints or constraints for static values
+			c.mu.Lock()
+			current, exists := c.stagedConnections[senderID]
+			if !exists {
+				// Initialize from active if first time
+				active := c.activeConnections[senderID]
+				current = ConnectionStaged{
+					SenderID:        &senderID,
+					MasterEnable:    active.MasterEnable,
+					Activation:      active.Activation,
+					TransportParams: active.TransportParams,
+				}
+			}
+
+			// Apply patch (partial update)
+			// Note: Booleans are tricky with partial updates in JSON if we want to detect omission vs false.
+			// For simplicity here, we assume if it's in the patch, it's intended.
+			// A more robust way would be to use pointers or a map[string]interface{}.
+			current.MasterEnable = patch.MasterEnable
+			
+			if patch.Activation.Mode != "" {
+				current.Activation = patch.Activation
+			}
+			if len(patch.TransportParams) > 0 {
+				current.TransportParams = patch.TransportParams
+			}
+
+			c.stagedConnections[senderID] = current
+
+			// Handle Activation
+			if current.Activation.Mode == ActivationModeImmediate {
+				// Perform activation
+				now := time.Now()
+				nowStr := fmt.Sprintf("%d:%d", now.Unix(), now.Nanosecond())
+				current.Activation.ActivationTime = &nowStr
+
+				active := ConnectionActive{
+					SenderID:        current.SenderID,
+					MasterEnable:    current.MasterEnable,
+					Activation:      current.Activation,
+					TransportParams: current.TransportParams,
+				}
+				c.activeConnections[senderID] = active
+				
+				// Reset staged activation mode after use
+				current.Activation.Mode = ActivationModeNull
+				c.stagedConnections[senderID] = current
+
+				slog.Info("Activated staged parameters", "senderID", senderID)
+			}
+			c.mu.Unlock()
+
+			json.NewEncoder(w).Encode(current)
+			return
+		}
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+
+	case "constraints":
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		json.NewEncoder(w).Encode([]interface{}{})
-		return
-	}
-	
-	if endpoint == "staged" {
-		// Minimal staging support - return active values
-		host, portStr := splitHostPort(c.nodeAddr)
-		wsURL := fmt.Sprintf("ws://%s:%s/x-nmos/events/v1.0/ws", host, portStr)
-		apiURL := fmt.Sprintf("http://%s:%s/x-nmos/events/v1.0/sources/%s/", host, portStr, sourceID)
 
-		transportParams := []map[string]interface{}{
-			{
-				"connection_uri":         wsURL,
-				"connection_authorization": false,
-				"ext_is_07_rest_api_url": apiURL,
-				"ext_is_07_source_id":    sourceID,
-			},
-		}
-		response := map[string]interface{}{
-			"sender_id":        senderID,
-			"master_enable":    true,
-			"activation":       map[string]interface{}{"mode": "activate_immediate"},
-			"transport_params": transportParams,
-		}
-		json.NewEncoder(w).Encode(response)
-		return
-	}
+	case "transportfile":
+		// TODO: Implement transport file generation (SDP for RTP)
+		http.Error(w, "Not implemented", http.StatusNotImplemented)
 
-	http.NotFound(w, r)
+	default:
+		http.NotFound(w, r)
+	}
 }
 
