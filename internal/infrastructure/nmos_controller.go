@@ -47,6 +47,9 @@ type nmosController struct {
 
 	controlCallback func(deviceID, controlID string, value interface{})
 
+	// Heartbeat
+	heartbeatInterval time.Duration
+
 	// IS-12 NCP support
 	ncpObjects map[int]NcObject
 	ncpMu      sync.RWMutex
@@ -87,6 +90,7 @@ func NewNMOSController(addr string) NMOSController {
 		nodeID:           nodeID,
 		registryURL:      "http://localhost:8000", // Default NMOS registry address
 		httpClient:       &http.Client{Timeout: 10 * time.Second},
+		heartbeatInterval: 5 * time.Second,
 		resources:        make(map[string][]interface{}),
 		deviceControls:   make(map[string][]map[string]interface{}),
 		ncpObjects:       make(map[int]NcObject),
@@ -190,6 +194,119 @@ func (c *nmosController) discoverAndRegister(ctx context.Context) {
 	case c.registryResolved <- c.registryURL:
 	default:
 	}
+
+	// Start heartbeating
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.startHeartbeat(ctx)
+	}()
+}
+
+// startHeartbeat manages the periodic heartbeat to the registration API
+func (c *nmosController) startHeartbeat(ctx context.Context) {
+	ticker := time.NewTicker(c.heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.done:
+			return
+		case <-ticker.C:
+			c.performHeartbeat(ctx)
+		}
+	}
+}
+
+// performHeartbeat executes a single heartbeat and handles re-registration if needed
+func (c *nmosController) performHeartbeat(ctx context.Context) {
+	heartbeatURL := fmt.Sprintf("%s/x-nmos/registration/v1.3/health/nodes/%s", c.registryURL, c.nodeID)
+	req, err := http.NewRequestWithContext(ctx, "POST", heartbeatURL, nil)
+	if err != nil {
+		slog.Error("Failed to create heartbeat request", "error", err)
+		return
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		slog.Warn("Heartbeat failed", "url", heartbeatURL, "error", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		slog.Debug("NMOS Heartbeat successful")
+	case http.StatusNotFound:
+		slog.Warn("NMOS Registry returned 404 for heartbeat, re-registering everything")
+		c.reRegisterAll(ctx)
+	default:
+		slog.Warn("NMOS Registry returned unexpected status for heartbeat", "status", resp.StatusCode)
+	}
+}
+
+// reRegisterAll re-registers the node and all cached resources in order
+func (c *nmosController) reRegisterAll(ctx context.Context) {
+	// 1. Re-register Node
+	node := c.buildNodeResource(c.nodeID)
+	if err := c.RegisterNode(node); err != nil {
+		slog.Error("Failed to re-register node", "error", err)
+		return
+	}
+
+	// 2. Re-register all other resources in order
+	// NMOS order: Devices -> Sources -> Flows -> Senders -> Receivers
+	resourceOrder := []string{"devices", "sources", "flows", "senders", "receivers"}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	for _, resourceType := range resourceOrder {
+		resources := c.resources[resourceType]
+		for _, res := range resources {
+			if err := c.registerResourceToRegistry(ctx, resourceType, res); err != nil {
+				slog.Error("Failed to re-register resource", "type", resourceType, "error", err)
+			}
+		}
+	}
+}
+
+// registerResourceToRegistry POSTs a resource to the NMOS registry
+func (c *nmosController) registerResourceToRegistry(ctx context.Context, resourceType string, resource interface{}) error {
+	// Wrap resource in IS-04 resource envelope
+	wrapper := map[string]interface{}{
+		"type": resourceType,
+		"data": resource,
+	}
+
+	resourceJSON, err := json.Marshal(wrapper)
+	if err != nil {
+		return fmt.Errorf("failed to marshal resource: %w", err)
+	}
+
+	// POST to registry
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("%s/x-nmos/registration/v1.3/resource", c.registryURL),
+		bytes.NewReader(resourceJSON))
+	if err != nil {
+		return fmt.Errorf("failed to create registry request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to register resource with registry: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		slog.Info("Registered resource with registry", "type", resourceType)
+		return nil
+	}
+	
+	return fmt.Errorf("registry rejected resource registration: status %d", resp.StatusCode)
 }
 
 // discoverRegistry searches for an NMOS registry via mDNS
@@ -1085,7 +1202,7 @@ func (c *nmosController) RegisterResource(resourceType string, resource interfac
 									
 									// Notify registry of device update
 									// We do this in a goroutine to avoid blocking/deadlock if registerResourceToRegistry calls back
-									go c.registerResourceToRegistry("devices", dMap)
+									go c.registerResourceToRegistry(c.ctx, "devices", dMap)
 								}
 								break
 							}
@@ -1097,51 +1214,13 @@ func (c *nmosController) RegisterResource(resourceType string, resource interfac
 			c.mu.Unlock()
 			c.broadcastUpdate(resourceType, resource)
 			// Also update in registry
-			go c.registerResourceToRegistry(resourceType, resource)
+			go c.registerResourceToRegistry(c.ctx, resourceType, resource)
 			return nil
 		}
 	}
 
 	c.mu.Unlock()
 	return fmt.Errorf("invalid resource format (missing id)")
-}
-
-// registerResourceToRegistry POSTs a resource to the NMOS registry
-func (c *nmosController) registerResourceToRegistry(resourceType string, resource interface{}) {
-	// Wrap resource in IS-04 resource envelope
-	wrapper := map[string]interface{}{
-		"type": resourceType,
-		"data": resource,
-	}
-
-	resourceJSON, err := json.Marshal(wrapper)
-	if err != nil {
-		slog.Error("Failed to marshal resource for registry", "type", resourceType, "error", err)
-		return
-	}
-
-	// POST to registry
-	req, err := http.NewRequestWithContext(context.Background(), "POST",
-		fmt.Sprintf("%s/x-nmos/registration/v1.3/resource", c.registryURL),
-		bytes.NewReader(resourceJSON))
-	if err != nil {
-		slog.Error("Failed to create registry request", "type", resourceType, "error", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		slog.Error("Failed to register resource with registry", "type", resourceType, "error", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		slog.Info("Registered resource with registry", "type", resourceType)
-	} else {
-		slog.Warn("Registry rejected resource registration", "type", resourceType, "status", resp.StatusCode)
-	}
 }
 
 // UpdateResource updates an existing NMOS resource
@@ -1204,7 +1283,23 @@ func (c *nmosController) RegisterNode(node interface{}) error {
 
 	// Store node locally
 	c.mu.Lock()
-	c.nodes = append(c.nodes, node)
+	exists := false
+	if nodeMap, ok := node.(map[string]interface{}); ok {
+		if id, ok := nodeMap["id"].(string); ok {
+			for i, n := range c.nodes {
+				if nMap, ok := n.(map[string]interface{}); ok {
+					if nMap["id"] == id {
+						c.nodes[i] = node
+						exists = true
+						break
+					}
+				}
+			}
+		}
+	}
+	if !exists {
+		c.nodes = append(c.nodes, node)
+	}
 	c.mu.Unlock()
 
 	return nil

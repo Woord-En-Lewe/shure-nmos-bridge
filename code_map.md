@@ -29,7 +29,7 @@
 - **when_to_use**: Use this module when you need to understand or modify how the gateway interacts with external systems (Shure devices, NMOS registry/event systems)
 - **public_types**: 
   - ShureController - Interface for Shure Axient communication
-  - NMOSController - Interface for NMOS IS-04/IS-05 communication (added UpdateResource and BroadcastEvent methods, IS-07 websocket support for real-time events, automatic registry discovery and node registration)
+  - NMOSController - Interface for NMOS IS-04/IS-05 communication (added UpdateResource and BroadcastEvent methods, IS-07 websocket support for real-time events, automatic registry discovery, node self-registration, and IS-04 heartbeat loop with automatic re-registration)
   - MessageBus - Interface for internal message passing (defined in message_bus.go)
   - Message - Structure for messages passed between components (added Source field for origin tracking)
   - MessageType - Type definition for message categorization (defined in message_bus.go)
