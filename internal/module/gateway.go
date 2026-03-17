@@ -23,8 +23,11 @@ type Gateway interface {
 type shureDeviceInfo struct {
 	ctrl          infrastructure.ShureController
 	lastSeen      time.Time
-	nmosDeviceIDs map[int]string      // channel -> deviceID
-	parameterOIDs map[string]int      // param_key -> oid (e.g. "1_AUDIO_GAIN" -> 101)
+	nmosDeviceIDs map[int]string            // channel -> deviceID
+	parameterOIDs map[string]int            // param_key -> oid (e.g. "1_AUDIO_GAIN" -> 101)
+	sourceIDs     map[int]map[string]string // channel -> param -> sourceID
+	flowIDs       map[int]map[string]string // channel -> param -> flowID
+	senderIDs     map[int]map[string]string // channel -> param -> senderID
 }
 
 // gatewayImpl is the concrete implementation of the Gateway interface
@@ -131,15 +134,18 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 	g.shureCtrls[addr] = &shureDeviceInfo{
 		ctrl:          ctrl,
 		lastSeen:      time.Now(),
-		nmosDeviceIDs: map[int]string{0: deviceID, 1: deviceID}, // Default mapping for initial discovery
+		nmosDeviceIDs: map[int]string{0: deviceID},
 		parameterOIDs: make(map[string]int),
+		sourceIDs:     make(map[int]map[string]string),
+		flowIDs:       make(map[int]map[string]string),
+		senderIDs:     make(map[int]map[string]string),
 	}
 	slog.Info("Connected to Shure device", "address", addr)
 
 	// Start event listener for this controller
 	go g.listenToShureEvents(ctx, addr, ctrl.ReceiveEvents())
 
-	// Discovery Sequence: Use the "God Command" to get everything
+	// Discovery Sequence
 	go func() {
 		time.Sleep(500 * time.Millisecond)
 		slog.Info("Requesting full device discovery", "address", addr)
@@ -154,7 +160,7 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		ctrl.SendCommand(fmt.Sprintf("< SAMPLE 0 ALL >\n"))
 	}()
 
-	// Initial NMOS Registration (will be updated as ALL reports come in)
+	// Initial NMOS Registration
 	g.nmosCtrl.RegisterResource("devices", map[string]interface{}{
 		"id":          deviceID,
 		"version":     fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond()),
@@ -162,10 +168,16 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		"description": fmt.Sprintf("Axient Digital at %s", addr),
 		"tags":        map[string]interface{}{"source": dev.Info["source"]},
 		"node_id":     g.nmosCtrl.GetNodeID(),
+		"senders":     []string{},
+		"receivers":   []string{},
 		"controls": []interface{}{
 			map[string]interface{}{
 				"type": "urn:x-nmos:control:sr-ctrl/v1.0",
-				"href": fmt.Sprintf("http://%s/x-nmos/node/v1.3/devices/%s/controls/", g.nmosAddr, deviceID),
+				"href": fmt.Sprintf("http://%s/x-nmos/connection/v1.1/", g.nmosAddr),
+			},
+			map[string]interface{}{
+				"type": "urn:x-nmos:control:events/v1.0",
+				"href": fmt.Sprintf("http://%s/x-nmos/events/v1.0/", g.nmosAddr),
 			},
 			map[string]interface{}{
 				"type": "urn:x-nmos:control:ncp/v1.0",
@@ -173,6 +185,76 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 			},
 		},
 	})
+
+	// Register Sources, Flows and Senders for up to 4 channels
+	meteredParams := []string{
+		"CHAN_QUALITY", "AUDIO_LED_BITMAP", "AUDIO_LEVEL_PEAK", "AUDIO_LEVEL_RMS",
+		"ANTENNA_STATUS", "RF_LED_BITMAP_A", "RF_RSSI_A", "RF_LED_BITMAP_B", "RF_RSSI_B",
+		"RF_LED_BITMAP_C", "RF_RSSI_C", "RF_LED_BITMAP_D", "RF_RSSI_D",
+	}
+
+	for i := 1; i <= 4; i++ {
+		g.shureCtrls[addr].nmosDeviceIDs[i] = deviceID
+		g.shureCtrls[addr].sourceIDs[i] = make(map[string]string)
+		g.shureCtrls[addr].flowIDs[i] = make(map[string]string)
+		g.shureCtrls[addr].senderIDs[i] = make(map[string]string)
+
+		for _, param := range meteredParams {
+			sourceID := uuid.New().String()
+			flowID := uuid.New().String()
+			senderID := uuid.New().String()
+			
+			// Normalize param key (to lower case for internal lookups if needed, or keep upper for consistency with Shure)
+			// Let's keep upper case key for consistency with Shure param names
+			g.shureCtrls[addr].sourceIDs[i][param] = sourceID
+			g.shureCtrls[addr].flowIDs[i][param] = flowID
+			g.shureCtrls[addr].senderIDs[i][param] = senderID
+
+			eventType := getNMOSEventType(param)
+
+			// Register Source (IS-04)
+			g.nmosCtrl.RegisterResource("sources", map[string]interface{}{
+				"id":          sourceID,
+				"version":     fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond()),
+				"label":       fmt.Sprintf("%s Channel %d %s", dev.Instance, i, param),
+				"description": fmt.Sprintf("Event source for %s on Channel %d", param, i),
+				"format":      "urn:x-nmos:format:data",
+				"caps":        map[string]interface{}{},
+				"device_id":   deviceID,
+				"parents":     []string{},
+				"clock_name":  nil,
+				"event_type":  eventType,
+			})
+
+			// Register Flow (IS-04)
+			g.nmosCtrl.RegisterResource("flows", map[string]interface{}{
+				"id":          flowID,
+				"version":     fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond()),
+				"label":       fmt.Sprintf("%s Channel %d %s Flow", dev.Instance, i, param),
+				"description": fmt.Sprintf("Event flow for %s on Channel %d", param, i),
+				"format":      "urn:x-nmos:format:data",
+				"tags":        map[string]interface{}{},
+				"source_id":   sourceID,
+				"device_id":   deviceID,
+				"parents":     []string{},
+				"media_type":  "application/json",
+				"event_type":  eventType,
+			})
+
+			// Register Sender (IS-04)
+			g.nmosCtrl.RegisterResource("senders", map[string]interface{}{
+				"id":          senderID,
+				"version":     fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond()),
+				"label":       fmt.Sprintf("%s Channel %d %s Sender", dev.Instance, i, param),
+				"description": fmt.Sprintf("IS-07 event sender for %s on Channel %d", param, i),
+				"device_id":   deviceID,
+				"flow_id":     flowID,
+				"transport":   "urn:x-nmos:transport:websocket",
+				"interface_bindings": []string{"eth0"},
+				"manifest_href":      nil,
+			})
+		}
+	}
 
 	// IS-12 NCP Setup
 	// Register custom classes if they are not already registered
@@ -286,6 +368,18 @@ func (g *gatewayImpl) processMessages(ctx context.Context) {
 	}
 }
 
+// getNMOSEventType returns the NMOS event type for a Shure parameter
+func getNMOSEventType(param string) string {
+	switch param {
+	case "AUDIO_MUTE", "MUTE":
+		return "boolean"
+	case "AUDIO_GAIN", "AUDIO_LEVEL_PEAK", "AUDIO_LEVEL_RMS", "RSSI", "RF_RSSI_A", "RF_RSSI_B", "CHAN_QUALITY":
+		return "number"
+	default:
+		return "string"
+	}
+}
+
 // handleShureDevice processes Shure device messages and translates to NMOS
 func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 	report, ok := msg.Payload.(*infrastructure.TPCIReport)
@@ -306,49 +400,119 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 		deviceID = info.nmosDeviceIDs[0]
 	}
 
-	// IS-12 NCP Parameter Updates
-	paramKey := fmt.Sprintf("%d_%s", report.Channel, report.Param)
-	g.mu.Lock()
-	oid, exists := info.parameterOIDs[paramKey]
-	if !exists && (report.Param == "AUDIO_GAIN" || report.Param == "MUTE") {
-		// Allocate a new OID for this parameter
-		oid = 1000 + len(info.parameterOIDs) + (len(g.shureCtrls) * 100)
-		info.parameterOIDs[paramKey] = oid
-
-		// Create Worker based on parameter type
-		var classID []int
-		if report.Param == "AUDIO_GAIN" {
-			classID = []int{1, 2, 1, 1} // Gain Worker
-		} else {
-			classID = []int{1, 2, 1, 2} // Mute Worker
-		}
-
-		worker := infrastructure.NewNcWorker(oid, classID, nil, report.Param, fmt.Sprintf("%s Channel %d", report.Param, report.Channel))
-		worker.Value = report.Value
-
-		// Set callback to send command back to Shure
-		worker.OnSet = func(val interface{}) error {
-			cmd := fmt.Sprintf("< SET %d %s %v >\n", report.Channel, report.Param, val)
-			return info.ctrl.SendCommand(cmd)
-		}
-
-		g.nmosCtrl.RegisterNCPObject(oid, worker)
-
-		// Add to Device Block
-		deviceOID := 100 + (len(g.shureCtrls)-1)*10 // Approximate device OID
-		if devObj := g.nmosCtrl.GetNCPObject(deviceOID); devObj != nil {
-			if db, ok := devObj.(*infrastructure.NcBlock); ok {
-				db.AddItem(oid)
+	// IS-07 (Events) Logic
+	if report.Type == "SAMPLE" && report.Param == "ALL" {
+		vals := strings.Fields(report.Value)
+		if len(vals) >= 9 {
+			if sID, ok := info.sourceIDs[report.Channel]["CHAN_QUALITY"]; ok {
+				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["CHAN_QUALITY"], "number", vals[0])
+			}
+			if sID, ok := info.sourceIDs[report.Channel]["AUDIO_LED_BITMAP"]; ok {
+				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["AUDIO_LED_BITMAP"], "string", vals[1])
+			}
+			if sID, ok := info.sourceIDs[report.Channel]["AUDIO_LEVEL_PEAK"]; ok {
+				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["AUDIO_LEVEL_PEAK"], "number", vals[2])
+			}
+			if sID, ok := info.sourceIDs[report.Channel]["AUDIO_LEVEL_RMS"]; ok {
+				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["AUDIO_LEVEL_RMS"], "number", vals[3])
+			}
+			if sID, ok := info.sourceIDs[report.Channel]["ANTENNA_STATUS"]; ok {
+				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["ANTENNA_STATUS"], "string", vals[4])
+			}
+			if sID, ok := info.sourceIDs[report.Channel]["RF_LED_BITMAP_A"]; ok {
+				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_LED_BITMAP_A"], "string", vals[5])
+			}
+			if sID, ok := info.sourceIDs[report.Channel]["RF_RSSI_A"]; ok {
+				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_RSSI_A"], "number", vals[6])
+			}
+			if sID, ok := info.sourceIDs[report.Channel]["RF_LED_BITMAP_B"]; ok {
+				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_LED_BITMAP_B"], "string", vals[7])
+			}
+			if sID, ok := info.sourceIDs[report.Channel]["RF_RSSI_B"]; ok {
+				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_RSSI_B"], "number", vals[8])
+			}
+			
+			// If it's Quadversity, there are more
+			if len(vals) >= 13 {
+				if sID, ok := info.sourceIDs[report.Channel]["RF_LED_BITMAP_C"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_LED_BITMAP_C"], "string", vals[9])
+				}
+				if sID, ok := info.sourceIDs[report.Channel]["RF_RSSI_C"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_RSSI_C"], "number", vals[10])
+				}
+				if sID, ok := info.sourceIDs[report.Channel]["RF_LED_BITMAP_D"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_LED_BITMAP_D"], "string", vals[11])
+				}
+				if sID, ok := info.sourceIDs[report.Channel]["RF_RSSI_D"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_RSSI_D"], "number", vals[12])
+				}
 			}
 		}
+	} else if infrastructure.IsMeteredParam(report.Param) {
+		// Even if it comes via REP (GET response), if it's a metered param, it goes to IS-07
+		if sID, ok := info.sourceIDs[report.Channel][report.Param]; ok {
+			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel][report.Param], getNMOSEventType(report.Param), report.Value)
+		}
 	}
-	g.mu.Unlock()
 
-	// Update existing worker value
-	if exists {
-		if obj := g.nmosCtrl.GetNCPObject(oid); obj != nil {
-			if worker, ok := obj.(*infrastructure.NcWorker); ok {
-				worker.SetProperty(infrastructure.NCPPropertyID{Level: 2, Index: 1}, report.Value)
+	// IS-12 NCP Parameter Updates
+	// REP messages should go to NCP
+	if report.Type == "REP" && report.Param != "ALL" {
+		paramKey := fmt.Sprintf("%d_%s", report.Channel, report.Param)
+		g.mu.Lock()
+		oid, exists := info.parameterOIDs[paramKey]
+		
+		// Decide if we should create a worker for this parameter
+		// We avoid purely informational or transient parameters
+		shouldCreateWorker := !exists && 
+			report.Param != "METER_RATE" && 
+			report.Param != "SAMPLE" && 
+			report.Param != "FLASH"
+			
+		if shouldCreateWorker {
+			// Allocate a new OID for this parameter
+			oid = 1000 + len(info.parameterOIDs) + (len(g.shureCtrls) * 100)
+			info.parameterOIDs[paramKey] = oid
+
+			// Create Worker based on parameter type
+			var classID []int
+			switch report.Param {
+			case "AUDIO_GAIN":
+				classID = []int{1, 2, 1, 1} // Gain Worker
+			case "AUDIO_MUTE", "MUTE":
+				classID = []int{1, 2, 1, 2} // Mute Worker
+			default:
+				classID = []int{1, 2} // Generic Worker
+			}
+
+			worker := infrastructure.NewNcWorker(oid, classID, nil, report.Param, fmt.Sprintf("%s Channel %d", report.Param, report.Channel))
+			worker.Value = report.Value
+
+			// Set callback to send command back to Shure
+			paramToSet := report.Param
+			worker.OnSet = func(val interface{}) error {
+				cmd := fmt.Sprintf("< SET %d %s %v >\n", report.Channel, paramToSet, val)
+				return info.ctrl.SendCommand(cmd)
+			}
+
+			g.nmosCtrl.RegisterNCPObject(oid, worker)
+
+			// Add to Device Block
+			deviceOID := 100 + (len(g.shureCtrls)-1)*10 // Approximate device OID
+			if devObj := g.nmosCtrl.GetNCPObject(deviceOID); devObj != nil {
+				if db, ok := devObj.(*infrastructure.NcBlock); ok {
+					db.AddItem(oid)
+				}
+			}
+		}
+		g.mu.Unlock()
+
+		// Update existing worker value
+		if exists {
+			if obj := g.nmosCtrl.GetNCPObject(oid); obj != nil {
+				if worker, ok := obj.(*infrastructure.NcWorker); ok {
+					worker.SetProperty(infrastructure.NCPPropertyID{Level: 2, Index: 1}, report.Value)
+				}
 			}
 		}
 	}
@@ -357,7 +521,7 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 		return
 	}
 
-	// Update the NMOS resource with the new data
+	// Update the NMOS resource (IS-04) with the new data
 	g.nmosCtrl.UpdateResource("devices", deviceID, func(r interface{}) interface{} {
 		res, ok := r.(map[string]interface{})
 		if !ok {
@@ -370,7 +534,7 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 			res["tags"] = tags
 		}
 
-		// Handle different parameters
+		// Handle different parameters for tags
 		if report.Param == "MODEL" {
 			res["description"] = fmt.Sprintf("%s at %s", report.Value, msg.Source)
 		}
@@ -383,7 +547,7 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 		tags[report.Param] = []string{fmt.Sprint(report.Value)}
 
 		// Dynamically assign controls if this is a new parameter
-		// Exclude METER_RATE and SAMPLE as they are internal metering commands, not user controls
+		// Exclude internal/metering commands
 		if report.Param != "METER_RATE" && report.Param != "SAMPLE" && report.Param != "ALL" {
 			controls := g.nmosCtrl.GetControls(deviceID)
 			found := false
@@ -400,7 +564,7 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 					"type":  "number",
 					"value": report.Value,
 				}
-				if report.Param == "MUTE" {
+				if report.Param == "AUDIO_MUTE" || report.Param == "MUTE" {
 					newControl["type"] = "boolean"
 				}
 
@@ -409,8 +573,8 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 			}
 		}
 
-		if strings.Contains(report.Raw, "SAMPLE") && report.Param == "ALL" {
-			// Parse sample ALL values according to documentation
+		// Update tags from SAMPLE ALL too
+		if report.Type == "SAMPLE" && report.Param == "ALL" {
 			vals := strings.Fields(report.Value)
 			if len(vals) >= 9 {
 				tags["channel_quality"] = []string{vals[0]}
@@ -422,18 +586,6 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 				tags["rf_rssi_a"] = []string{vals[6]}
 				tags["rf_led_bitmap_b"] = []string{vals[7]}
 				tags["rf_rssi_b"] = []string{vals[8]}
-
-				// Broadcast IS-07 events
-				source := fmt.Sprintf("%s/%d", deviceID, report.Channel)
-				g.nmosCtrl.BroadcastEvent(source, "channel_quality", vals[0])
-				g.nmosCtrl.BroadcastEvent(source, "audio_led_bitmap", vals[1])
-				g.nmosCtrl.BroadcastEvent(source, "audio_peak", vals[2])
-				g.nmosCtrl.BroadcastEvent(source, "audio_rms", vals[3])
-				g.nmosCtrl.BroadcastEvent(source, "antenna_status", vals[4])
-				g.nmosCtrl.BroadcastEvent(source, "rf_led_bitmap_a", vals[5])
-				g.nmosCtrl.BroadcastEvent(source, "rf_rssi_a", vals[6])
-				g.nmosCtrl.BroadcastEvent(source, "rf_led_bitmap_b", vals[7])
-				g.nmosCtrl.BroadcastEvent(source, "rf_rssi_b", vals[8])
 			}
 		}
 

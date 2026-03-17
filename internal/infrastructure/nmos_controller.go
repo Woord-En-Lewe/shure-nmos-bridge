@@ -36,7 +36,8 @@ type nmosController struct {
 
 	// Websocket support (IS-07)
 	upgrader websocket.Upgrader
-	clients  map[*websocket.Conn]bool
+	clients  map[*websocket.Conn]map[string]bool // client -> sourceID -> subscribed
+	lastEvents map[string]map[string]interface{} // sourceID -> last event message
 
 	// Registry discovery
 	registryResolved chan string
@@ -92,7 +93,8 @@ func NewNMOSController(addr string) NMOSController {
 		ncpClients:       make(map[*websocket.Conn]bool),
 		eventsChan:       make(chan interface{}, 100),
 		done:             make(chan struct{}),
-		clients:          make(map[*websocket.Conn]bool),
+		clients:          make(map[*websocket.Conn]map[string]bool),
+		lastEvents:       make(map[string]map[string]interface{}),
 		registryResolved: make(chan string, 1),
 		ctx:              ctx,
 		cancel:           cancel,
@@ -319,6 +321,10 @@ func (c *nmosController) startServer() error {
 	mux.HandleFunc("/x-nmos/node/v1.3/ncp", c.handleNCP)
 	mux.HandleFunc("/x-nmos/node/v1.3/ncp/", c.handleNCP)
 
+	// Implement IS-05 Connection Management API
+	mux.HandleFunc("/x-nmos/connection/v1.1/", c.handleConnectionRoot)
+	mux.HandleFunc("/x-nmos/connection/v1.1/single/senders/", c.handleConnectionSenders)
+
 	c.httpServer = &http.Server{
 		Addr:    c.nodeAddr,
 		Handler: corsMux,
@@ -384,6 +390,19 @@ func (c *nmosController) startMDNS() error {
 		return fmt.Errorf("failed to register NMOS Events mDNS: %w", err)
 	}
 	c.eventsServer = eventsServer
+
+	// Advertise NMOS Connection API
+	_, err = zeroconf.Register(
+		"nmos-connection-"+c.nodeID,
+		"_nmos-connection._tcp",
+		"local.",
+		port,
+		[]string{"api_ver=v1.1", "api_proto=http"},
+		nil,
+	)
+	if err != nil {
+		slog.Warn("Failed to register NMOS Connection mDNS", "error", err)
+	}
 
 	slog.Info("NMOS services advertised via mDNS", "host", host, "port", port)
 	return nil
@@ -654,7 +673,7 @@ func (c *nmosController) handleWebsocket(w http.ResponseWriter, r *http.Request)
 	}
 
 	c.mu.Lock()
-	c.clients[conn] = true
+	c.clients[conn] = make(map[string]bool)
 	c.mu.Unlock()
 
 	slog.Info("New NMOS IS-07 websocket client connected")
@@ -670,9 +689,75 @@ func (c *nmosController) handleWebsocket(w http.ResponseWriter, r *http.Request)
 		}()
 
 		for {
-			_, _, err := conn.ReadMessage()
+			_, message, err := conn.ReadMessage()
 			if err != nil {
 				break
+			}
+
+			// Handle IS-07 Commands
+			var msg map[string]interface{}
+			if err := json.Unmarshal(message, &msg); err == nil {
+				if cmd, ok := msg["command"].(string); ok {
+					switch cmd {
+					case "health":
+						originTimestamp := ""
+						if ts, ok := msg["timestamp"].(string); ok {
+							originTimestamp = ts
+						}
+
+						now := time.Now()
+						creationTimestamp := fmt.Sprintf("%d:%d", now.Unix(), now.Nanosecond())
+
+						response := map[string]interface{}{
+							"message_type": "health",
+							"timing": map[string]string{
+								"origin_timestamp":   originTimestamp,
+								"creation_timestamp": creationTimestamp,
+							},
+						}
+
+						if respJSON, err := json.Marshal(response); err == nil {
+							c.mu.RLock()
+							if _, exists := c.clients[conn]; exists {
+								conn.WriteMessage(websocket.TextMessage, respJSON)
+							}
+							c.mu.RUnlock()
+						}
+
+					case "subscription":
+						if sources, ok := msg["sources"].([]interface{}); ok {
+							subs := make(map[string]bool)
+							var eventsToSend []map[string]interface{}
+
+							c.mu.Lock()
+							for _, s := range sources {
+								if sID, ok := s.(string); ok {
+									subs[sID] = true
+									if lastEvent, exists := c.lastEvents[sID]; exists {
+										eventsToSend = append(eventsToSend, lastEvent)
+									}
+								}
+							}
+							
+							if _, exists := c.clients[conn]; exists {
+								c.clients[conn] = subs
+								slog.Info("Client updated subscriptions", "count", len(subs))
+							}
+							c.mu.Unlock()
+
+							// Send initial states
+							for _, evt := range eventsToSend {
+								if jsonBytes, err := json.Marshal(evt); err == nil {
+									c.mu.RLock()
+									if _, exists := c.clients[conn]; exists {
+										conn.WriteMessage(websocket.TextMessage, jsonBytes)
+									}
+									c.mu.RUnlock()
+								}
+							}
+						}
+					}
+				}
 			}
 		}
 	}()
@@ -711,12 +796,23 @@ func (c *nmosController) broadcastUpdate(resourceType string, resource interface
 	}
 }
 
-// BroadcastEvent sends an IS-07 event to all connected websocket clients
-func (c *nmosController) BroadcastEvent(source string, eventType string, data interface{}) {
+// BroadcastEvent sends an IS-07 event to all connected websocket clients using the NMOS state message format
+func (c *nmosController) BroadcastEvent(sourceID string, flowID string, eventType string, data interface{}) {
 	c.mu.RLock()
+	// Filter clients that have subscribed to this source
 	clients := make([]*websocket.Conn, 0, len(c.clients))
-	for client := range c.clients {
-		clients = append(clients, client)
+	for client, subs := range c.clients {
+		if subs == nil || len(subs) == 0 {
+			// If no subscriptions are set, we assume broadcast/all (or strictly conform to IS-07 which requires subscription)
+			// However, for debugging/legacy clients, we might want to default to allowing unless strict.
+			// IS-07 says: "After establishing the subscriptions list, the client will start receiving events only for the sources it has subscribed to."
+			// This implies if no subscription list is established, no events are received.
+			// But for initial compatibility, let's keep it strict: only send if subscribed.
+			continue
+		}
+		if subs[sourceID] {
+			clients = append(clients, client)
+		}
 	}
 	c.mu.RUnlock()
 
@@ -724,13 +820,28 @@ func (c *nmosController) BroadcastEvent(source string, eventType string, data in
 		return
 	}
 
+	now := time.Now()
+	timestamp := fmt.Sprintf("%d:%d", now.Unix(), now.Nanosecond())
+
 	event := map[string]interface{}{
-		"type":       "event",
-		"source":     source,
+		"message_type": "state",
+		"identity": map[string]string{
+			"source_id": sourceID,
+			"flow_id":   flowID,
+		},
 		"event_type": eventType,
-		"data":       data,
-		"timestamp":  time.Now().Format(time.RFC3339),
+		"timing": map[string]string{
+			"creation_timestamp": timestamp,
+		},
+		"payload": map[string]interface{}{
+			"value": data,
+		},
 	}
+
+	// Update cache
+	c.mu.Lock()
+	c.lastEvents[sourceID] = event
+	c.mu.Unlock()
 
 	eventJSON, _ := json.Marshal(event)
 
@@ -841,7 +952,7 @@ func (c *nmosController) handleDeviceControls(w http.ResponseWriter, r *http.Req
 			}
 
 			// Also broadcast update as an IS-07 event
-			c.BroadcastEvent(fmt.Sprintf("%s/controls/%s", deviceID, controlID), controlID, body.Value)
+			c.BroadcastEvent(fmt.Sprintf("%s/controls/%s", deviceID, controlID), controlID, "number", body.Value)
 
 			w.WriteHeader(http.StatusAccepted)
 			return
@@ -913,31 +1024,86 @@ func (c *nmosController) RegisterResource(resourceType string, resource interfac
 	// If it's a map with an ID, check if it already exists
 	if resMap, ok := resource.(map[string]interface{}); ok {
 		if id, ok := resMap["id"].(string); ok {
+			// Check for updates
+			updated := false
 			for i, r := range c.resources[resourceType] {
 				if rMap, ok := r.(map[string]interface{}); ok {
 					if rMap["id"] == id {
 						c.resources[resourceType][i] = resource
 						slog.Debug("Updated NMOS resource", "type", resourceType, "id", id)
-						c.mu.Unlock()
-						c.broadcastUpdate(resourceType, resource)
-						// Also update in registry
-						go c.registerResourceToRegistry(resourceType, resource)
-						return nil
+						updated = true
+						break
 					}
 				}
 			}
+			
+			if !updated {
+				c.resources[resourceType] = append(c.resources[resourceType], resource)
+				slog.Info("Registered NMOS resource", "type", resourceType)
+			}
+
+			// Auto-update parent Device's senders/receivers list
+			if resourceType == "senders" || resourceType == "receivers" {
+				if deviceID, ok := resMap["device_id"].(string); ok {
+					for i, d := range c.resources["devices"] {
+						if dMap, ok := d.(map[string]interface{}); ok {
+							if dMap["id"] == deviceID {
+								// Found parent device, update list
+								listKey := resourceType // "senders" or "receivers"
+								
+								// Create list if missing
+								if _, ok := dMap[listKey]; !ok {
+									dMap[listKey] = []string{}
+								}
+
+								// Check if ID already in list
+								list, _ := dMap[listKey].([]string) // Type assertion might fail if it was []interface{}, need care
+								
+								// Handle potential type mismatch if initialized as []interface{}
+								if list == nil {
+									if interfaceList, ok := dMap[listKey].([]interface{}); ok {
+										for _, item := range interfaceList {
+											if s, ok := item.(string); ok {
+												list = append(list, s)
+											}
+										}
+									}
+								}
+
+								exists := false
+								for _, existingID := range list {
+									if existingID == id {
+										exists = true
+										break
+									}
+								}
+
+								if !exists {
+									list = append(list, id)
+									dMap[listKey] = list
+									c.resources["devices"][i] = dMap // Save back
+									
+									// Notify registry of device update
+									// We do this in a goroutine to avoid blocking/deadlock if registerResourceToRegistry calls back
+									go c.registerResourceToRegistry("devices", dMap)
+								}
+								break
+							}
+						}
+					}
+				}
+			}
+
+			c.mu.Unlock()
+			c.broadcastUpdate(resourceType, resource)
+			// Also update in registry
+			go c.registerResourceToRegistry(resourceType, resource)
+			return nil
 		}
 	}
 
-	c.resources[resourceType] = append(c.resources[resourceType], resource)
-	slog.Info("Registered NMOS resource", "type", resourceType)
 	c.mu.Unlock()
-	c.broadcastUpdate(resourceType, resource)
-
-	// Also register with registry
-	go c.registerResourceToRegistry(resourceType, resource)
-
-	return nil
+	return fmt.Errorf("invalid resource format (missing id)")
 }
 
 // registerResourceToRegistry POSTs a resource to the NMOS registry
@@ -1157,3 +1323,141 @@ func (c *nmosController) pollEvents(ctx context.Context) {
 		c.mu.Unlock()
 	}
 }
+
+// handleConnectionRoot handles the root of the Connection API
+func (c *nmosController) handleConnectionRoot(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/x-nmos/connection/v1.1/" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]string{"single/"})
+		return
+	}
+	if r.URL.Path == "/x-nmos/connection/v1.1/single/" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]string{"senders/"})
+		return
+	}
+	if r.URL.Path == "/x-nmos/connection/v1.1/single/senders/" {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		var ids []string
+		for _, s := range c.resources["senders"] {
+			if sMap, ok := s.(map[string]interface{}); ok {
+				if id, ok := sMap["id"].(string); ok {
+					ids = append(ids, id+"/")
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ids)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+// handleConnectionSenders handles /single/senders/{senderId}/...
+func (c *nmosController) handleConnectionSenders(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/x-nmos/connection/v1.1/single/senders/")
+	parts := strings.Split(path, "/")
+	
+	if len(parts) < 2 { // senderId/endpoint
+		http.NotFound(w, r)
+		return
+	}
+	
+	senderID := parts[0]
+	endpoint := parts[1]
+
+	c.mu.RLock()
+	var foundSender map[string]interface{}
+	for _, s := range c.resources["senders"] {
+		if sMap, ok := s.(map[string]interface{}); ok {
+			if sMap["id"] == senderID {
+				foundSender = sMap
+				break
+			}
+		}
+	}
+	
+	if foundSender == nil {
+		c.mu.RUnlock()
+		http.NotFound(w, r)
+		return
+	}
+
+	// Find Source ID via Flow ID
+	var sourceID string
+	if flowID, ok := foundSender["flow_id"].(string); ok {
+		for _, f := range c.resources["flows"] {
+			if fMap, ok := f.(map[string]interface{}); ok {
+				if fMap["id"] == flowID {
+					if sID, ok := fMap["source_id"].(string); ok {
+						sourceID = sID
+					}
+					break
+				}
+			}
+		}
+	}
+	c.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if endpoint == "active" {
+		host, portStr := splitHostPort(c.nodeAddr)
+		// Assume standard websocket port or use node port
+		wsURL := fmt.Sprintf("ws://%s:%s/x-nmos/events/v1.0/ws", host, portStr)
+		
+		apiURL := fmt.Sprintf("http://%s:%s/x-nmos/events/v1.0/sources/%s/", host, portStr, sourceID)
+
+		transportParams := []map[string]interface{}{
+			{
+				"connection_uri":         wsURL,
+				"connection_authorization": false,
+				"ext_is_07_rest_api_url": apiURL,
+				"ext_is_07_source_id":    sourceID,
+			},
+		}
+
+		response := map[string]interface{}{
+			"sender_id":        senderID,
+			"master_enable":    true,
+			"activation":       map[string]interface{}{"mode": "activate_immediate"},
+			"transport_params": transportParams,
+		}
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	if endpoint == "constraints" {
+		// return empty constraints or constraints for static values
+		json.NewEncoder(w).Encode([]interface{}{})
+		return
+	}
+	
+	if endpoint == "staged" {
+		// Minimal staging support - return active values
+		host, portStr := splitHostPort(c.nodeAddr)
+		wsURL := fmt.Sprintf("ws://%s:%s/x-nmos/events/v1.0/ws", host, portStr)
+		apiURL := fmt.Sprintf("http://%s:%s/x-nmos/events/v1.0/sources/%s/", host, portStr, sourceID)
+
+		transportParams := []map[string]interface{}{
+			{
+				"connection_uri":         wsURL,
+				"connection_authorization": false,
+				"ext_is_07_rest_api_url": apiURL,
+				"ext_is_07_source_id":    sourceID,
+			},
+		}
+		response := map[string]interface{}{
+			"sender_id":        senderID,
+			"master_enable":    true,
+			"activation":       map[string]interface{}{"mode": "activate_immediate"},
+			"transport_params": transportParams,
+		}
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	http.NotFound(w, r)
+}
+

@@ -132,10 +132,22 @@ func (d DeviceID) String() string { return string(d) }
 
 // TPCIReport represents a parsed Axient Digital response
 type TPCIReport struct {
+	Type    string // REP or SAMPLE
 	Channel int
 	Param   string
 	Value   string
 	Raw     string
+}
+
+// IsMeteredParam returns true if the parameter is a metered property
+func IsMeteredParam(param string) bool {
+	switch param {
+	case "CHAN_QUALITY", "AUDIO_LED_BITMAP", "AUDIO_LEVEL_PEAK", "AUDIO_LEVEL_RMS",
+		"ANTENNA_STATUS", "RSSI_LED_BITMAP", "RSSI":
+		return true
+	default:
+		return false
+	}
 }
 
 // ParseTPCIResponse handles the Axient TPCI format including padded strings
@@ -154,7 +166,10 @@ func ParseTPCIResponse(response string) *TPCIReport {
 		return nil
 	}
 
-	report := &TPCIReport{Raw: response}
+	report := &TPCIReport{
+		Type: msgType,
+		Raw:  response,
+	}
 	idx := 1
 
 	// Check for channel index

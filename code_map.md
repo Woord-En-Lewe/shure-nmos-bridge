@@ -36,6 +36,7 @@
   - ShureCommandBuilder - Builder pattern for creating Shure commands
   - Gain, Mute, Frequency, Channel, DeviceID - Domain-specific types for Shure parameters
   - DeviceStatus - Domain type for parsed Shure device status
+  - TPCIReport - Parsed Shure response including Type (REP/SAMPLE), Channel, Param, and Value
   - ShureDiscoverer - Robust mDNS-based discovery for Shure Axient devices using zeroconf
   - DiscoveredDevice - Representation of a discovered Shure device
 - **public_functions**: 
@@ -43,5 +44,7 @@
   - NewNMOSController(addr string) NMOSController - Factory for NMOS controller (now automatically discovers registries and registers the node)
   - NewInMemoryMessageBus() MessageBus - Factory for in-memory message bus
   - NewShureCommand(command string) *ShureCommandBuilder - Factory for command builder
+  - ParseTPCIResponse(response string) *TPCIReport - Parse TPCI strings into structured reports
+  - IsMeteredParam(param string) bool - Identifies if a parameter is a metered property (IS-07)
   - ParseDeviceStatus(response string) (*DeviceStatus, error) - Parse Shure responses into domain types
   - NewShureDiscoverer() *ShureDiscoverer - Factory for mDNS discovery of Shure devices

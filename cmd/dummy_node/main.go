@@ -39,10 +39,16 @@ func main() {
 		"description": "A simulated NMOS node with gain and fader controls",
 		"tags":        map[string]interface{}{"type": []string{"dummy"}},
 		"node_id":     nmosCtrl.GetNodeID(),
+		"senders":     []string{},
+		"receivers":   []string{},
 		"controls": []interface{}{
 			map[string]interface{}{
 				"type": "urn:x-nmos:control:sr-ctrl/v1.0",
-				"href": fmt.Sprintf("http://%s/x-nmos/node/v1.3/devices/%s/controls/", *nmosAddr, deviceID),
+				"href": fmt.Sprintf("http://%s/x-nmos/connection/v1.1/", *nmosAddr),
+			},
+			map[string]interface{}{
+				"type": "urn:x-nmos:control:events/v1.0",
+				"href": fmt.Sprintf("http://%s/x-nmos/events/v1.0/", *nmosAddr),
 			},
 			map[string]interface{}{
 				"type": "urn:x-nmos:control:ncp/v1.0",
@@ -50,6 +56,51 @@ func main() {
 			},
 		},
 	})
+
+	// Register separate resources for each parameter
+	registerParam := func(paramName, eventType string) (string, string) {
+		sourceID := fmt.Sprintf("dummy-source-%s", paramName)
+		flowID := fmt.Sprintf("dummy-flow-%s", paramName)
+		senderID := fmt.Sprintf("dummy-sender-%s", paramName)
+
+		nmosCtrl.RegisterResource("sources", map[string]interface{}{
+			"id":          sourceID,
+			"version":     fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond()),
+			"label":       fmt.Sprintf("Dummy %s Source", paramName),
+			"format":      "urn:x-nmos:format:data",
+			"device_id":   deviceID,
+			"event_type":  eventType,
+		})
+
+		nmosCtrl.RegisterResource("flows", map[string]interface{}{
+			"id":          flowID,
+			"version":     fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond()),
+			"label":       fmt.Sprintf("Dummy %s Flow", paramName),
+			"format":      "urn:x-nmos:format:data",
+			"source_id":   sourceID,
+			"device_id":   deviceID,
+			"media_type":  "application/json",
+			"event_type":  eventType,
+		})
+
+		nmosCtrl.RegisterResource("senders", map[string]interface{}{
+			"id":          senderID,
+			"version":     fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond()),
+			"label":       fmt.Sprintf("Dummy %s Sender", paramName),
+			"device_id":   deviceID,
+			"flow_id":     flowID,
+			"transport":   "urn:x-nmos:transport:websocket",
+			"manifest_href": nil,
+		})
+		
+		return sourceID, flowID
+	}
+
+	volSrc, volFlow := registerParam("volume", "number")
+	qualSrc, qualFlow := registerParam("chan_quality", "number")
+	peakSrc, peakFlow := registerParam("audio_peak", "number")
+	rssiSrc, rssiFlow := registerParam("rf_rssi_a", "number")
+	muteSrc, muteFlow := registerParam("mic_mute", "boolean")
 
 	// IS-12 NCP Setup for Dummy Device
 	nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
@@ -168,7 +219,7 @@ func main() {
 		}
 	})
 
-	// Simulate volume events
+	// Simulate Shure-specific IS-07 events
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
@@ -179,8 +230,25 @@ func main() {
 			case <-ticker.C:
 				// Simulate a volume level between -60 and 0 dB
 				volume := -60.0 + rand.Float64()*60.0
-				nmosCtrl.BroadcastEvent(deviceID, "volume", volume)
-				slog.Debug("Sent simulated volume", "volume", volume)
+				nmosCtrl.BroadcastEvent(volSrc, volFlow, "number", volume)
+				
+				// Channel Quality: 000 to 005
+				quality := rand.Intn(6)
+				nmosCtrl.BroadcastEvent(qualSrc, qualFlow, "number", fmt.Sprintf("%03d", quality))
+				
+				// Audio Peak: 000 to 120 (actual is -120 to 0 dBFS)
+				peak := 80 + rand.Intn(41) // Simulate -40 to 0 dBFS
+				nmosCtrl.BroadcastEvent(peakSrc, peakFlow, "number", fmt.Sprintf("%03d", peak))
+				
+				// RF RSSI A: 000 to 120 (actual is -120 to 0 dBm)
+				rssi := 90 + rand.Intn(31) // Simulate -30 to 0 dBm
+				nmosCtrl.BroadcastEvent(rssiSrc, rssiFlow, "number", fmt.Sprintf("%03d", rssi))
+				
+				// Mic Mute: boolean
+				mute := rand.Float32() < 0.1 // 10% chance to toggle
+				nmosCtrl.BroadcastEvent(muteSrc, muteFlow, "boolean", mute)
+
+				slog.Debug("Sent simulated Shure IS-07 events", "quality", quality, "peak", peak, "rssi", rssi, "mute", mute)
 			}
 		}
 	}()
