@@ -70,6 +70,10 @@ type nmosController struct {
 	// Connection Management (IS-05)
 	stagedConnections map[string]ConnectionStaged // resourceID -> staged state
 	activeConnections map[string]ConnectionActive // resourceID -> active state
+
+	// IS-04 Registration state
+	registered   bool
+	registeredMu sync.RWMutex
 }
 
 // NewNMOSController creates a new NMOSController instance
@@ -194,6 +198,11 @@ func (c *nmosController) discoverAndRegister(ctx context.Context) {
 		slog.Warn("Failed to register node with registry", "error", err)
 		return
 	}
+
+	// Mark as successfully registered
+	c.registeredMu.Lock()
+	c.registered = true
+	c.registeredMu.Unlock()
 
 	// Signal that registration is complete
 	select {
@@ -344,6 +353,16 @@ func (c *nmosController) unregisterResourceFromRegistry(ctx context.Context, res
 
 // unregisterAll performs a controlled unregistration of all resources in order
 func (c *nmosController) unregisterAll(ctx context.Context) {
+	// Check if we were ever successfully registered
+	c.registeredMu.RLock()
+	wasRegistered := c.registered
+	c.registeredMu.RUnlock()
+
+	if !wasRegistered {
+		slog.Info("Skipping NMOS unregistration - node was never registered")
+		return
+	}
+
 	slog.Info("Performing NMOS controlled unregistration")
 
 	// Order of deletion (reverse of registration): Receivers -> Senders -> Flows -> Sources -> Devices
