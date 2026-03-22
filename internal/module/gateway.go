@@ -630,7 +630,10 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 				}
 			}
 		}
-	} else if infrastructure.IsMeteredParam(report.Param) {
+	}
+
+	// IS-07: Metered params create senders and broadcast events
+	if infrastructure.IsMeteredParam(report.Param) {
 		// REP responses establish current state - broadcast as IS-07 event
 		// This allows consumers to subscribe and receive current values
 		deviceID := info.nmosDeviceIDs[0]
