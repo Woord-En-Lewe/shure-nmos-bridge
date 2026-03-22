@@ -80,23 +80,31 @@ func (c *shureController) signalDone() {
 
 // Stop halts the Shure controller
 func (c *shureController) Stop(ctx context.Context) error {
+	slog.Info("ShureController.Stop called", "addr", c.addr)
 	if !c.isRunning {
+		slog.Info("ShureController.Stop - not running", "addr", c.addr)
 		return nil
 	}
 
+	slog.Info("ShureController.Stop - signaling done", "addr", c.addr)
 	c.signalDone()
 
 	// Force unblock any read operations with a deadline
 	if c.conn != nil {
+		slog.Info("ShureController.Stop - closing connection", "addr", c.addr)
 		c.conn.SetReadDeadline(time.Now().Add(-1 * time.Second))
 		c.conn.Close()
 	}
 
 	// Wait for goroutines to finish
+	slog.Info("ShureController.Stop - waiting for wg", "addr", c.addr)
 	c.wg.Wait()
+	slog.Info("ShureController.Stop - wg done", "addr", c.addr)
 
 	// Close events channel
+	slog.Info("ShureController.Stop - closing events", "addr", c.addr)
 	close(c.events)
+	slog.Info("ShureController.Stop complete", "addr", c.addr)
 
 	return nil
 }

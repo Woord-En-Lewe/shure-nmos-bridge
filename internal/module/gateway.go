@@ -320,13 +320,17 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 
 // listenToShureEvents listens for events from a specific Shure controller
 func (g *gatewayImpl) listenToShureEvents(ctx context.Context, addr string, events <-chan interface{}) {
+	slog.Info("listenToShureEvents started", "address", addr)
+	defer slog.Info("listenToShureEvents exiting", "address", addr)
 	for {
 		select {
 		case <-ctx.Done():
+			slog.Info("listenToShureEvents ctx done", "address", addr)
 			return
 		case ev, ok := <-events:
 			if !ok {
 				// Channel closed, exit
+				slog.Info("listenToShureEvents events channel closed", "address", addr)
 				return
 			}
 			if report, ok := ev.(*infrastructure.TPCIReport); ok {
@@ -346,11 +350,14 @@ func (g *gatewayImpl) listenToShureEvents(ctx context.Context, addr string, even
 				}
 
 				// Forward to message bus for NMOS translation
-				g.messageBus.Send(infrastructure.Message{
+				slog.Debug("listenToShureEvents sending to messageBus", "address", addr, "param", report.Param)
+				if err := g.messageBus.Send(infrastructure.Message{
 					Type:    infrastructure.ShureDeviceMsg,
 					Payload: report,
 					Source:  addr,
-				})
+				}); err != nil {
+					slog.Warn("listenToShureEvents send failed", "address", addr, "error", err)
+				}
 			}
 		}
 	}
@@ -358,38 +365,63 @@ func (g *gatewayImpl) listenToShureEvents(ctx context.Context, addr string, even
 
 // Stop gracefully shuts down the gateway components
 func (g *gatewayImpl) Stop(ctx context.Context) error {
+	slog.Info("Gateway Stop called")
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	slog.Info("Gateway Stop lock acquired")
 
 	// Stop discoverer
 	if g.discoverer != nil {
+		slog.Info("Stopping discoverer")
 		if err := g.discoverer.Stop(); err != nil {
 			slog.Error("Error stopping discoverer", "error", err)
 		}
 	}
 
 	// Stop all Shure controllers
+	slog.Info("Stopping Shure controllers", "count", len(g.shureCtrls))
 	for addr, info := range g.shureCtrls {
+		slog.Info("Stopping Shure controller", "address", addr)
 		if err := info.ctrl.Stop(ctx); err != nil {
 			slog.Error("Error stopping Shure controller", "address", addr, "error", err)
 		}
 	}
+	slog.Info("All Shure controllers stopped")
 
 	// Stop NMOS controller
+	slog.Info("Stopping NMOS controller")
 	if err := g.nmosCtrl.Stop(ctx); err != nil {
+		slog.Error("Error stopping NMOS controller", "error", err)
 		return err
 	}
+	slog.Info("NMOS controller stopped")
+
+	// Stop message bus
+	slog.Info("Stopping message bus")
+	if mb, ok := g.messageBus.(*infrastructure.InMemoryMessageBus); ok {
+		mb.Close()
+	}
+	slog.Info("Message bus stopped")
+
+	slog.Info("Gateway Stop complete")
 
 	return nil
 }
 
 // processMessages handles message passing between Shure and NMOS controllers
 func (g *gatewayImpl) processMessages(ctx context.Context) {
+	slog.Info("processMessages started")
+	defer slog.Info("processMessages exiting")
 	for {
 		select {
 		case <-ctx.Done():
+			slog.Info("processMessages ctx done")
 			return
-		case msg := <-g.messageBus.Receive():
+		case msg, ok := <-g.messageBus.Receive():
+			if !ok {
+				slog.Info("processMessages receive channel closed")
+				return
+			}
 			// Translate Shure messages to NMOS and vice versa
 			// This is where the actual protocol translation happens
 			switch msg.Type {

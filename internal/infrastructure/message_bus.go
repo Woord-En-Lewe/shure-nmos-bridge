@@ -2,6 +2,7 @@ package infrastructure
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 )
 
@@ -79,8 +80,12 @@ func (mb *InMemoryMessageBus) Receive() <-chan Message {
 
 // Close closes the message bus
 func (mb *InMemoryMessageBus) Close() {
+	slog.Info("InMemoryMessageBus.Close called")
 	mb.cancel()
+	slog.Info("InMemoryMessageBus.Close - waiting wg")
 	mb.wg.Wait()
+	slog.Info("InMemoryMessageBus.Close - wg done, closing channels")
 	close(mb.sendChan)
 	close(mb.receiveChan)
+	slog.Info("InMemoryMessageBus.Close complete")
 }
