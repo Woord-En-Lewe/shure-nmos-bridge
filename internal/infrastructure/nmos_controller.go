@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/grandcat/zeroconf"
@@ -35,9 +37,10 @@ type nmosController struct {
 	mu             sync.RWMutex
 
 	// Websocket support (IS-07)
-	upgrader websocket.Upgrader
-	clients  map[*websocket.Conn]map[string]bool // client -> sourceID -> subscribed
-	lastEvents map[string]map[string]interface{} // sourceID -> last event message
+	upgrader         websocket.Upgrader
+	clients          map[*websocket.Conn]map[string]bool // client -> sourceID -> subscribed
+	lastEvents       map[string]map[string]interface{}   // sourceID -> last event message
+	clientLastHealth map[*websocket.Conn]time.Time       // client -> last health timestamp
 
 	// Registry discovery
 	registryResolved chan string
@@ -51,10 +54,13 @@ type nmosController struct {
 	heartbeatInterval time.Duration
 
 	// IS-12 NCP support
-	ncpObjects map[int]NcObject
-	ncpMu      sync.RWMutex
-	ncpClients map[*websocket.Conn]bool
-	ncpClientsMu sync.Mutex
+	ncpObjects         map[int]NcObject
+	ncpMu              sync.RWMutex
+	ncpClients         map[*websocket.Conn]bool
+	ncpClientsMu       sync.Mutex
+	ncpSubscriptions   map[int]map[int]NcObject // subscriptionID -> (objectID -> object) for tracking subscriptions
+	ncpSubMu           sync.RWMutex
+	nextSubscriptionID int
 
 	// mDNS advertisement
 	nodeServer   *zeroconf.Server
@@ -66,22 +72,6 @@ type nmosController struct {
 	activeConnections map[string]ConnectionActive // resourceID -> active state
 }
 
-// corsMiddleware adds CORS headers to all responses
-func (c *nmosController) corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
 // NewNMOSController creates a new NMOSController instance
 func NewNMOSController(addr string) NMOSController {
 	if addr == "" {
@@ -90,24 +80,27 @@ func NewNMOSController(addr string) NMOSController {
 	ctx, cancel := context.WithCancel(context.Background())
 	nodeID := uuid.New().String()
 	ctrl := &nmosController{
-		nodeAddr:         addr,
-		nodeID:           nodeID,
-		registryURL:      "http://localhost:8000", // Default NMOS registry address
-		httpClient:       &http.Client{Timeout: 10 * time.Second},
-		heartbeatInterval: 5 * time.Second,
-		resources:        make(map[string][]interface{}),
-		deviceControls:   make(map[string][]map[string]interface{}),
-		ncpObjects:       make(map[int]NcObject),
-		ncpClients:       make(map[*websocket.Conn]bool),
-		eventsChan:       make(chan interface{}, 100),
-		done:             make(chan struct{}),
-		clients:          make(map[*websocket.Conn]map[string]bool),
-		lastEvents:       make(map[string]map[string]interface{}),
-		registryResolved: make(chan string, 1),
-		ctx:              ctx,
-		cancel:           cancel,
-		stagedConnections: make(map[string]ConnectionStaged),
-		activeConnections: make(map[string]ConnectionActive),
+		nodeAddr:           addr,
+		nodeID:             nodeID,
+		registryURL:        "http://localhost:8000", // Default NMOS registry address
+		httpClient:         &http.Client{Timeout: 10 * time.Second},
+		heartbeatInterval:  5 * time.Second,
+		resources:          make(map[string][]interface{}),
+		deviceControls:     make(map[string][]map[string]interface{}),
+		ncpObjects:         make(map[int]NcObject),
+		ncpClients:         make(map[*websocket.Conn]bool),
+		ncpSubscriptions:   make(map[int]map[int]NcObject),
+		nextSubscriptionID: 1,
+		eventsChan:         make(chan interface{}, 100),
+		done:               make(chan struct{}),
+		clients:            make(map[*websocket.Conn]map[string]bool),
+		lastEvents:         make(map[string]map[string]interface{}),
+		clientLastHealth:   make(map[*websocket.Conn]time.Time),
+		registryResolved:   make(chan string, 1),
+		ctx:                ctx,
+		cancel:             cancel,
+		stagedConnections:  make(map[string]ConnectionStaged),
+		activeConnections:  make(map[string]ConnectionActive),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -171,6 +164,13 @@ func (c *nmosController) Start(ctx context.Context) error {
 	go func() {
 		defer c.wg.Done()
 		c.listenForEvents(ctx)
+	}()
+
+	// Start IS-07 WebSocket heartbeat timeout checker (IS-07: 12s timeout)
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.checkIS07Heartbeats(ctx)
 	}()
 
 	return nil
@@ -311,7 +311,7 @@ func (c *nmosController) registerResourceToRegistry(ctx context.Context, resourc
 		slog.Info("Registered resource with registry", "type", resourceType)
 		return nil
 	}
-	
+
 	return fmt.Errorf("registry rejected resource registration: status %d", resp.StatusCode)
 }
 
@@ -484,36 +484,11 @@ func splitHostPort(addr string) (host, port string) {
 
 // startServer initializes and starts the NMOS Node API HTTP server
 func (c *nmosController) startServer() error {
-	mux := http.NewServeMux()
-
-	// Wrap mux with CORS middleware
-	corsMux := c.corsMiddleware(mux)
-
-	// Implement basic IS-04 Node API endpoints
-	mux.HandleFunc("/x-nmos/node/v1.3/", c.handleNodeRoot)
-	mux.HandleFunc("/x-nmos/node/v1.3/self/", c.handleNodeSelf)
-	mux.HandleFunc("/x-nmos/node/v1.3/devices/", c.handleNodeDevices)
-	mux.HandleFunc("/x-nmos/node/v1.3/devices/{id}/controls/", c.handleDeviceControls)
-	mux.HandleFunc("/x-nmos/node/v1.3/sources/", c.handleNodeSources)
-	mux.HandleFunc("/x-nmos/node/v1.3/flows/", c.handleNodeFlows)
-	mux.HandleFunc("/x-nmos/node/v1.3/senders/", c.handleNodeSenders)
-	mux.HandleFunc("/x-nmos/node/v1.3/receivers/", c.handleNodeReceivers)
-
-	// Implement IS-07 Event & Tally Websocket endpoint
-	mux.HandleFunc("/x-nmos/events/v1.0/", c.handleEventsRoot)
-	mux.HandleFunc("/x-nmos/events/v1.0/ws", c.handleWebsocket)
-
-	// Implement IS-12 NCP Websocket endpoint
-	mux.HandleFunc("/x-nmos/node/v1.3/ncp", c.handleNCP)
-	mux.HandleFunc("/x-nmos/node/v1.3/ncp/", c.handleNCP)
-
-	// Implement IS-05 Connection Management API
-	mux.HandleFunc("/x-nmos/connection/v1.1/", c.handleConnectionRoot)
-	mux.HandleFunc("/x-nmos/connection/v1.1/single/senders/", c.handleConnectionSenders)
+	r := c.setupRouter()
 
 	c.httpServer = &http.Server{
 		Addr:    c.nodeAddr,
-		Handler: corsMux,
+		Handler: r,
 	}
 
 	go func() {
@@ -524,6 +499,80 @@ func (c *nmosController) startServer() error {
 	}()
 
 	return nil
+}
+
+func (c *nmosController) setupRouter() *chi.Mux {
+	r := chi.NewRouter()
+
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+	r.Use(corsMiddleware)
+
+	r.Get("/x-nmos/node/v1.3/", c.handleNodeRoot)
+	r.Get("/x-nmos/node/v1.3/self/", c.handleNodeSelf)
+	r.Get("/x-nmos/node/v1.3/devices/", c.handleNodeDevices)
+	r.Route("/x-nmos/node/v1.3/devices/{id}/controls/", func(r chi.Router) {
+		r.Get("/", c.handleDeviceControls)
+		r.Post("/", c.handleDeviceControls)
+		r.Put("/", c.handleDeviceControls)
+		r.Patch("/", c.handleDeviceControls)
+	})
+	r.Get("/x-nmos/node/v1.3/sources/", c.handleNodeSources)
+	r.Get("/x-nmos/node/v1.3/flows/", c.handleNodeFlows)
+	r.Get("/x-nmos/node/v1.3/senders/", c.handleNodeSenders)
+	r.Get("/x-nmos/node/v1.3/receivers/", c.handleNodeReceivers)
+
+	r.Get("/x-nmos/node/v1.3/ncp", c.handleNCP)
+	r.Get("/x-nmos/node/v1.3/ncp/", c.handleNCP)
+
+	r.Route("/x-nmos/events/v1.0/", func(r chi.Router) {
+		r.Get("/", c.handleEventsRoot)
+		r.Get("/ws", c.handleWebsocket)
+		r.Get("/events", c.handleWebsocket)
+		r.Get("/devices/{deviceId}", c.handleWebsocket)
+		r.Route("/sources/", func(r chi.Router) {
+			r.Get("/", c.handleEventsSourcesList)
+			r.Route("/{sourceId}", func(r chi.Router) {
+				r.Get("/state", c.handleEventsSourceState)
+				r.Get("/type", c.handleEventsSourceType)
+			})
+		})
+	})
+
+	r.Route("/x-nmos/connection/v1.1/", func(r chi.Router) {
+		r.Get("/", c.handleConnectionRoot)
+		r.Route("/single/", func(r chi.Router) {
+			r.Get("/", c.handleConnectionSingleRoot)
+			r.Route("/senders/", func(r chi.Router) {
+				r.Get("/", c.handleConnectionSendersList)
+				r.Route("/{senderId}", func(r chi.Router) {
+					r.Get("/active", c.handleConnectionSenderActive)
+					r.Get("/staged", c.handleConnectionSenderStaged)
+					r.Patch("/staged", c.handleConnectionSenderStaged)
+					r.Get("/constraints", c.handleConnectionSenderConstraints)
+				})
+			})
+		})
+	})
+
+	return r
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // startMDNS advertises NMOS services via mDNS
@@ -595,23 +644,17 @@ func (c *nmosController) startMDNS() error {
 }
 
 // BroadcastNCPNotification sends a notification to all connected NCP clients
-func (c *nmosController) BroadcastNCPNotification(oid int, eventID NCPEventID, data interface{}) {
+func (c *nmosController) BroadcastNCPNotification(oid int, eventID NCPEventID, eventData PropertyChangedEventData) {
 	c.ncpClientsMu.Lock()
 	defer c.ncpClientsMu.Unlock()
-
-	raw, err := json.Marshal(data)
-	if err != nil {
-		slog.Error("Failed to marshal NCP notification", "error", err)
-		return
-	}
 
 	msg := NCPMessage{
 		MessageType: NCPMessageTypeNotification,
 		Notifications: []NCPNotification{
 			{
-				OID:     oid,
-				EventID: eventID,
-				Data:    raw,
+				OID:       oid,
+				EventID:   eventID,
+				EventData: eventData,
 			},
 		},
 	}
@@ -632,10 +675,10 @@ func (c *nmosController) RegisterNCPObject(oid int, obj NcObject) {
 	obj.SetNotifyCallback(c.BroadcastNCPNotification)
 
 	if block, ok := obj.(*NcBlock); ok {
-		block.Resolver = func(oid int) NcObject {
+		block.SetResolver(func(oid int) NcObject {
 			// This is safe because ncpMu is not held during GetProperty in dispatchNCPCommand
 			return c.GetNCPObject(oid)
-		}
+		})
 	}
 	c.ncpObjects[oid] = obj
 }
@@ -647,7 +690,7 @@ func (c *nmosController) RegisterClass(class NcClassDescriptor) {
 
 	if manager, ok := cm.(*NcClassManager); ok {
 		key := classIDToKey(class.ClassID)
-		manager.Classes[key] = class
+		manager.ClassManager.Classes[key] = NcClassDescriptorToClassDescriptor(class)
 	}
 }
 
@@ -664,7 +707,14 @@ func (c *nmosController) handleNCP(w http.ResponseWriter, r *http.Request) {
 		slog.Error("Failed to upgrade NCP connection", "error", err)
 		return
 	}
-	
+
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
 	c.ncpClientsMu.Lock()
 	c.ncpClients[conn] = true
 	c.ncpClientsMu.Unlock()
@@ -681,11 +731,13 @@ func (c *nmosController) handleNCP(w http.ResponseWriter, r *http.Request) {
 	for {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			if !websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				slog.Error("NCP read error", "error", err)
 			}
 			break
 		}
+
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 
 		var ncpMsg NCPMessage
 		if err := json.Unmarshal(message, &ncpMsg); err != nil {
@@ -693,34 +745,48 @@ func (c *nmosController) handleNCP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if ncpMsg.MessageType == NCPMessageTypeCommand {
-			responses := make([]NCPResponse, 0, len(ncpMsg.Commands))
+		switch ncpMsg.MessageType {
+		case NCPMessageTypeCommand:
+			responses := make([]NCPCommandResponse, 0, len(ncpMsg.Commands))
 			for _, cmd := range ncpMsg.Commands {
 				resp := c.dispatchNCPCommand(cmd)
 				responses = append(responses, resp)
 			}
 
 			respMsg := NCPMessage{
-				MessageType: NCPMessageTypeResponse,
-				Responses:   responses,
+				MessageType:      NCPMessageTypeResponse,
+				CommandResponses: responses,
 			}
 
+			conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 			if err := conn.WriteJSON(respMsg); err != nil {
 				slog.Error("Failed to send NCP response", "error", err)
+				break
+			}
+
+		case NCPMessageTypeSubscription:
+			subscribed := c.handleSubscriptions(conn, ncpMsg.Subscriptions)
+			respMsg := NCPMessage{
+				MessageType:   NCPMessageTypeSubscriptionResponse,
+				Subscriptions: subscribed,
+			}
+			conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			if err := conn.WriteJSON(respMsg); err != nil {
+				slog.Error("Failed to send NCP subscription response", "error", err)
 				break
 			}
 		}
 	}
 }
 
-func (c *nmosController) dispatchNCPCommand(cmd NCPCommand) NCPResponse {
+func (c *nmosController) dispatchNCPCommand(cmd NCPCommand) NCPCommandResponse {
 	// Attempt to unmarshal arguments for property methods if needed
 	c.ncpMu.RLock()
 	obj, ok := c.ncpObjects[cmd.OID]
 	c.ncpMu.RUnlock()
 
 	if !ok {
-		return NCPResponse{
+		return NCPCommandResponse{
 			Handle: cmd.Handle,
 			Result: NCPMethodResult{Status: 404},
 		}
@@ -732,19 +798,19 @@ func (c *nmosController) dispatchNCPCommand(cmd NCPCommand) NCPResponse {
 			ID NCPPropertyID `json:"id"`
 		}
 		if err := json.Unmarshal(cmd.Arguments, &args); err != nil {
-			return NCPResponse{
+			return NCPCommandResponse{
 				Handle: cmd.Handle,
 				Result: NCPMethodResult{Status: 400},
 			}
 		}
 		val, err := obj.GetProperty(args.ID)
 		if err != nil {
-			return NCPResponse{
+			return NCPCommandResponse{
 				Handle: cmd.Handle,
 				Result: NCPMethodResult{Status: 404},
 			}
 		}
-		return NCPResponse{
+		return NCPCommandResponse{
 			Handle: cmd.Handle,
 			Result: NCPMethodResult{Status: 200, Value: val},
 		}
@@ -756,18 +822,18 @@ func (c *nmosController) dispatchNCPCommand(cmd NCPCommand) NCPResponse {
 			Value interface{}   `json:"value"`
 		}
 		if err := json.Unmarshal(cmd.Arguments, &args); err != nil {
-			return NCPResponse{
+			return NCPCommandResponse{
 				Handle: cmd.Handle,
 				Result: NCPMethodResult{Status: 400},
 			}
 		}
 		if err := obj.SetProperty(args.ID, args.Value); err != nil {
-			return NCPResponse{
+			return NCPCommandResponse{
 				Handle: cmd.Handle,
 				Result: NCPMethodResult{Status: 500},
 			}
 		}
-		return NCPResponse{
+		return NCPCommandResponse{
 			Handle: cmd.Handle,
 			Result: NCPMethodResult{Status: 200},
 		}
@@ -776,16 +842,36 @@ func (c *nmosController) dispatchNCPCommand(cmd NCPCommand) NCPResponse {
 	// General method invocation
 	val, err := obj.InvokeMethod(cmd.MethodID, cmd.Arguments)
 	if err != nil {
-		return NCPResponse{
+		return NCPCommandResponse{
 			Handle: cmd.Handle,
 			Result: NCPMethodResult{Status: 500},
 		}
 	}
 
-	return NCPResponse{
+	return NCPCommandResponse{
 		Handle: cmd.Handle,
 		Result: NCPMethodResult{Status: 200, Value: val},
 	}
+}
+
+// handleSubscriptions processes subscription requests from NCP clients
+// Returns list of OIDs that were successfully subscribed (per IS-12 spec)
+func (c *nmosController) handleSubscriptions(conn *websocket.Conn, subscriptionOIDs []int) []int {
+	var subscribed []int
+
+	for _, oid := range subscriptionOIDs {
+		c.ncpMu.RLock()
+		_, ok := c.ncpObjects[oid]
+		c.ncpMu.RUnlock()
+
+		if !ok {
+			continue
+		}
+
+		subscribed = append(subscribed, oid)
+	}
+
+	return subscribed
 }
 
 // Stop halts the NMOS controller
@@ -796,12 +882,13 @@ func (c *nmosController) Stop(ctx context.Context) error {
 
 	c.isRunning = false
 
-	// Perform controlled unregistration
-	unregCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	c.unregisterAll(unregCtx)
-
+	// Signal all goroutines to stop FIRST
 	close(c.done)
+
+	// Perform controlled unregistration (may fail silently if context expires)
+	unregCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	c.unregisterAll(unregCtx)
+	cancel()
 
 	// Stop mDNS advertisement
 	if c.nodeServer != nil {
@@ -811,18 +898,24 @@ func (c *nmosController) Stop(ctx context.Context) error {
 		c.eventsServer.Shutdown()
 	}
 
-	// Gracefully shut down the HTTP server
+	// Force close HTTP server and all connections
 	if c.httpServer != nil {
-		slog.Info("Shutting down NMOS Node API server")
-		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		if err := c.httpServer.Shutdown(shutdownCtx); err != nil {
-			slog.Error("Error during NMOS Node API server shutdown", "error", err)
-		}
+		slog.Info("Closing NMOS Node API server")
+		c.httpServer.Close()
 	}
 
-	// Wait for goroutines to finish
-	c.wg.Wait()
+	// Wait for goroutines to finish (with timeout)
+	done := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		slog.Debug("All goroutines finished")
+	case <-time.After(5 * time.Second):
+		slog.Warn("Goroutines did not finish in time, continuing anyway")
+	}
 
 	// Close events channel
 	close(c.eventsChan)
@@ -847,13 +940,80 @@ func (c *nmosController) handleNodeRoot(w http.ResponseWriter, r *http.Request) 
 	json.NewEncoder(w).Encode(endpoints)
 }
 
-// handleEventsRoot handles the root of the Events API
 func (c *nmosController) handleEventsRoot(w http.ResponseWriter, r *http.Request) {
-	endpoints := []string{
-		"ws",
-	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(endpoints)
+	json.NewEncoder(w).Encode([]string{"sources/"})
+}
+
+func (c *nmosController) handleEventsSourcesList(w http.ResponseWriter, r *http.Request) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var sourceIDs []string
+	for _, sources := range c.resources["sources"] {
+		if src, ok := sources.(map[string]interface{}); ok {
+			if id, ok := src["id"].(string); ok {
+				sourceIDs = append(sourceIDs, id+"/")
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(sourceIDs)
+}
+
+func (c *nmosController) handleEventsSourceState(w http.ResponseWriter, r *http.Request) {
+	sourceID := chi.URLParam(r, "sourceId")
+	if sourceID == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	c.mu.RLock()
+	event, exists := c.lastEvents[sourceID]
+	c.mu.RUnlock()
+
+	if !exists {
+		http.NotFound(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(event)
+}
+
+func (c *nmosController) handleEventsSourceType(w http.ResponseWriter, r *http.Request) {
+	sourceID := chi.URLParam(r, "sourceId")
+	if sourceID == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	c.mu.RLock()
+	var eventType string
+	for _, sources := range c.resources["sources"] {
+		if src, ok := sources.(map[string]interface{}); ok {
+			if id, ok := src["id"].(string); ok && id == sourceID {
+				if et, ok := src["event_type"].(string); ok {
+					eventType = et
+					break
+				}
+			}
+		}
+	}
+	c.mu.RUnlock()
+
+	if eventType == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	typeDef := map[string]interface{}{
+		"type": eventType,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(typeDef)
 }
 
 // handleWebsocket handles IS-07 websocket connections
@@ -864,17 +1024,24 @@ func (c *nmosController) handleWebsocket(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
 	c.mu.Lock()
 	c.clients[conn] = make(map[string]bool)
 	c.mu.Unlock()
 
 	slog.Info("New NMOS IS-07 websocket client connected")
 
-	// Read loop to handle client disconnects and keep-alives
 	go func() {
 		defer func() {
 			c.mu.Lock()
 			delete(c.clients, conn)
+			delete(c.clientLastHealth, conn)
 			c.mu.Unlock()
 			conn.Close()
 			slog.Info("NMOS IS-07 websocket client disconnected")
@@ -883,8 +1050,13 @@ func (c *nmosController) handleWebsocket(w http.ResponseWriter, r *http.Request)
 		for {
 			_, message, err := conn.ReadMessage()
 			if err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					slog.Debug("WebSocket read error", "error", err)
+				}
 				break
 			}
+
+			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 
 			// Handle IS-07 Commands
 			var msg map[string]interface{}
@@ -899,6 +1071,11 @@ func (c *nmosController) handleWebsocket(w http.ResponseWriter, r *http.Request)
 
 						now := time.Now()
 						creationTimestamp := fmt.Sprintf("%d:%d", now.Unix(), now.Nanosecond())
+
+						// Update last health time for this client (IS-07: track for 12s timeout)
+						c.mu.Lock()
+						c.clientLastHealth[conn] = now
+						c.mu.Unlock()
 
 						response := map[string]interface{}{
 							"message_type": "health",
@@ -930,7 +1107,7 @@ func (c *nmosController) handleWebsocket(w http.ResponseWriter, r *http.Request)
 									}
 								}
 							}
-							
+
 							if _, exists := c.clients[conn]; exists {
 								c.clients[conn] = subs
 								slog.Info("Client updated subscriptions", "count", len(subs))
@@ -977,13 +1154,57 @@ func (c *nmosController) broadcastUpdate(resourceType string, resource interface
 
 	updateJSON, _ := json.Marshal(update)
 
+	var failed []*websocket.Conn
 	for _, client := range clients {
 		if err := client.WriteMessage(websocket.TextMessage, updateJSON); err != nil {
 			slog.Error("Failed to send websocket update", "error", err)
-			c.mu.Lock()
+			failed = append(failed, client)
+		}
+	}
+
+	if len(failed) > 0 {
+		c.mu.Lock()
+		for _, client := range failed {
 			delete(c.clients, client)
-			c.mu.Unlock()
+			delete(c.clientLastHealth, client)
+		}
+		c.mu.Unlock()
+		for _, client := range failed {
 			client.Close()
+		}
+	}
+}
+
+const is07HeartbeatTimeout = 12 * time.Second
+
+func (c *nmosController) checkIS07Heartbeats(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.done:
+			return
+		case <-ticker.C:
+			now := time.Now()
+			c.mu.Lock()
+			var expired []*websocket.Conn
+			for conn, lastHealth := range c.clientLastHealth {
+				if now.Sub(lastHealth) > is07HeartbeatTimeout {
+					expired = append(expired, conn)
+				}
+			}
+			for _, conn := range expired {
+				delete(c.clients, conn)
+				delete(c.clientLastHealth, conn)
+			}
+			c.mu.Unlock()
+			for _, conn := range expired {
+				slog.Warn("IS-07 client heartbeat timeout, closing connection", "timeout", is07HeartbeatTimeout)
+				conn.Close()
+			}
 		}
 	}
 }
@@ -1153,42 +1374,38 @@ func (c *nmosController) handleDeviceControls(w http.ResponseWriter, r *http.Req
 
 	c.mu.RLock()
 	controls, ok := c.deviceControls[deviceID]
-	// Find device label
-	label := "Unknown Device"
-	for _, dev := range c.resources["devices"] {
-		if dMap, ok := dev.(map[string]interface{}); ok {
-			if dMap["id"] == deviceID {
-				if l, ok := dMap["label"].(string); ok {
-					label = l
-				}
-				break
-			}
-		}
-	}
 	c.mu.RUnlock()
 
-	if !ok {
-		// Fallback for devices without specific controls set yet
-		controls = []map[string]interface{}{
-			{
-				"name":        "Device Discovery",
-				"parameter":   "GET_ALL",
-				"type":        "trigger",
-				"description": "Trigger dynamic capability discovery",
-			},
-		}
+	host, portStr := splitHostPort(c.nodeAddr)
+	port := 8080
+	if p, err := strconv.Atoi(portStr); err == nil {
+		port = p
 	}
 
-	// Wrap in IS-12 Control Protocol structure
-	response := map[string]interface{}{
-		"id":         deviceID,
-		"label":      label,
-		"parameters": controls,
+	// Build IS-04 compliant controls array with NCP control
+	is04Controls := []map[string]interface{}{
+		{
+			"type": "urn:x-nmos:control:ncp/v1.0",
+			"href": fmt.Sprintf("ws://%s:%d/x-nmos/node/v1.3/ncp", host, port),
+		},
+		{
+			"type": "urn:x-nmos:control:events/v1.0",
+			"href": fmt.Sprintf("http://%s:%d/x-nmos/events/v1.0/", host, port),
+		},
+		{
+			"type": "urn:x-nmos:control:sr-ctrl/v1.0",
+			"href": fmt.Sprintf("http://%s:%d/x-nmos/connection/v1.1/", host, port),
+		},
+	}
+
+	// Add device-specific controls if they exist
+	if ok && len(controls) > 0 {
+		is04Controls = append(is04Controls, controls...)
 	}
 
 	slog.Debug("Serving controls", "deviceID", deviceID)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	json.NewEncoder(w).Encode(is04Controls)
 }
 
 func (c *nmosController) SetControls(deviceID string, controls []map[string]interface{}) {
@@ -1228,7 +1445,7 @@ func (c *nmosController) RegisterResource(resourceType string, resource interfac
 					}
 				}
 			}
-			
+
 			if !updated {
 				c.resources[resourceType] = append(c.resources[resourceType], resource)
 				slog.Info("Registered NMOS resource", "type", resourceType)
@@ -1242,7 +1459,7 @@ func (c *nmosController) RegisterResource(resourceType string, resource interfac
 							if dMap["id"] == deviceID {
 								// Found parent device, update list
 								listKey := resourceType // "senders" or "receivers"
-								
+
 								// Create list if missing
 								if _, ok := dMap[listKey]; !ok {
 									dMap[listKey] = []string{}
@@ -1250,7 +1467,7 @@ func (c *nmosController) RegisterResource(resourceType string, resource interfac
 
 								// Check if ID already in list
 								list, _ := dMap[listKey].([]string) // Type assertion might fail if it was []interface{}, need care
-								
+
 								// Handle potential type mismatch if initialized as []interface{}
 								if list == nil {
 									if interfaceList, ok := dMap[listKey].([]interface{}); ok {
@@ -1274,7 +1491,7 @@ func (c *nmosController) RegisterResource(resourceType string, resource interfac
 									list = append(list, id)
 									dMap[listKey] = list
 									c.resources["devices"][i] = dMap // Save back
-									
+
 									// Notify registry of device update
 									// We do this in a goroutine to avoid blocking/deadlock if registerResourceToRegistry calls back
 									go c.registerResourceToRegistry(c.ctx, "devices", dMap)
@@ -1494,192 +1711,172 @@ func (c *nmosController) pollEvents(ctx context.Context) {
 	}
 }
 
-// handleConnectionRoot handles the root of the Connection API
 func (c *nmosController) handleConnectionRoot(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/x-nmos/connection/v1.1/" {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]string{"single/"})
-		return
-	}
-	if r.URL.Path == "/x-nmos/connection/v1.1/single/" {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]string{"senders/"})
-		return
-	}
-	if r.URL.Path == "/x-nmos/connection/v1.1/single/senders/" {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		var ids []string
-		for _, s := range c.resources["senders"] {
-			if sMap, ok := s.(map[string]interface{}); ok {
-				if id, ok := sMap["id"].(string); ok {
-					ids = append(ids, id+"/")
-				}
-			}
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(ids)
-		return
-	}
-	http.NotFound(w, r)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode([]string{"single/"})
 }
 
-// handleConnectionSenders handles /single/senders/{senderId}/...
-func (c *nmosController) handleConnectionSenders(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/x-nmos/connection/v1.1/single/senders/")
-	parts := strings.Split(path, "/")
+func (c *nmosController) handleConnectionSingleRoot(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode([]string{"senders/"})
+}
 
-	if len(parts) < 2 { // senderId/endpoint
+func (c *nmosController) handleConnectionSendersList(w http.ResponseWriter, r *http.Request) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var ids []string
+	for _, s := range c.resources["senders"] {
+		if sMap, ok := s.(map[string]interface{}); ok {
+			if id, ok := sMap["id"].(string); ok {
+				ids = append(ids, id+"/")
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ids)
+}
+
+func (c *nmosController) handleConnectionSenderActive(w http.ResponseWriter, r *http.Request) {
+	senderID := chi.URLParam(r, "senderId")
+	if senderID == "" {
 		http.NotFound(w, r)
 		return
 	}
 
-	senderID := parts[0]
-	endpoint := parts[1]
-
 	c.mu.RLock()
-	var foundSender map[string]interface{}
-	for _, s := range c.resources["senders"] {
-		if sMap, ok := s.(map[string]interface{}); ok {
-			if sMap["id"] == senderID {
-				foundSender = sMap
-				break
-			}
+	active, exists := c.activeConnections[senderID]
+	if !exists {
+		active = ConnectionActive{
+			SenderID:        &senderID,
+			MasterEnable:    true,
+			Activation:      ConnectionActivation{Mode: ActivationModeImmediate},
+			TransportParams: c.getSenderTransportParams(senderID),
 		}
 	}
 	c.mu.RUnlock()
 
-	if foundSender == nil {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(active)
+}
+
+func (c *nmosController) getSenderTransportParams(senderID string) []map[string]interface{} {
+	for _, s := range c.resources["senders"] {
+		if sMap, ok := s.(map[string]interface{}); ok {
+			if sMap["id"] == senderID {
+				if tp, ok := sMap["transport_params"].([]map[string]interface{}); ok && len(tp) > 0 {
+					return tp
+				}
+				if deviceID, ok := sMap["device_id"].(string); ok {
+					if sourceID, ok := sMap["source_id"].(string); ok {
+						return []map[string]interface{}{
+							{
+								"connection_uri":           fmt.Sprintf("ws://%s/x-nmos/events/v1.0/devices/%s", c.nodeAddr, deviceID),
+								"connection_authorization": false,
+								"ext_is_07_rest_api_url":   fmt.Sprintf("http://%s/x-nmos/events/v1.0/sources/%s/", c.nodeAddr, sourceID),
+								"ext_is_07_source_id":      sourceID,
+							},
+						}
+					}
+					return []map[string]interface{}{
+						{
+							"connection_uri":           fmt.Sprintf("ws://%s/x-nmos/events/v1.0/devices/%s", c.nodeAddr, deviceID),
+							"connection_authorization": false,
+						},
+					}
+				}
+			}
+		}
+	}
+	return []map[string]interface{}{
+		{
+			"connection_uri":           fmt.Sprintf("ws://%s/x-nmos/events/v1.0/events", c.nodeAddr),
+			"connection_authorization": false,
+		},
+	}
+}
+
+func (c *nmosController) handleConnectionSenderStaged(w http.ResponseWriter, r *http.Request) {
+	senderID := chi.URLParam(r, "senderId")
+	if senderID == "" {
 		http.NotFound(w, r)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-
-	switch endpoint {
-	case "active":
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+	switch r.Method {
+	case http.MethodGet:
 		c.mu.RLock()
-		active, exists := c.activeConnections[senderID]
-		c.mu.RUnlock()
-
+		staged, exists := c.stagedConnections[senderID]
 		if !exists {
-			// Initialize with defaults if not exists
-			active = ConnectionActive{
-				SenderID:     &senderID,
-				MasterEnable: true,
-				Activation:   ConnectionActivation{Mode: ActivationModeImmediate},
-				TransportParams: []map[string]interface{}{
-					{
-						"connection_uri":           fmt.Sprintf("ws://%s/x-nmos/events/v1.0/ws", c.nodeAddr),
-						"connection_authorization": false,
-					},
-				},
+			active := c.activeConnections[senderID]
+			staged = ConnectionStaged{
+				SenderID:        &senderID,
+				MasterEnable:    active.MasterEnable,
+				Activation:      active.Activation,
+				TransportParams: active.TransportParams,
 			}
 		}
-		json.NewEncoder(w).Encode(active)
+		c.mu.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(staged)
 
-	case "staged":
-		if r.Method == http.MethodGet {
-			c.mu.RLock()
-			staged, exists := c.stagedConnections[senderID]
-			c.mu.RUnlock()
-
-			if !exists {
-				// Return active values as a fallback/default
-				c.mu.RLock()
-				active := c.activeConnections[senderID]
-				c.mu.RUnlock()
-				staged = ConnectionStaged{
-					SenderID:        &senderID,
-					MasterEnable:    active.MasterEnable,
-					Activation:      active.Activation,
-					TransportParams: active.TransportParams,
-				}
-			}
-			json.NewEncoder(w).Encode(staged)
+	case http.MethodPatch:
+		var patch ConnectionStaged
+		if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+			http.Error(w, "Invalid body", http.StatusBadRequest)
 			return
 		}
 
-		if r.Method == http.MethodPatch {
-			var patch ConnectionStaged
-			if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
-				http.Error(w, "Invalid body", http.StatusBadRequest)
-				return
+		c.mu.Lock()
+		current, exists := c.stagedConnections[senderID]
+		if !exists {
+			active := c.activeConnections[senderID]
+			current = ConnectionStaged{
+				SenderID:        &senderID,
+				MasterEnable:    active.MasterEnable,
+				Activation:      active.Activation,
+				TransportParams: active.TransportParams,
 			}
-
-			c.mu.Lock()
-			current, exists := c.stagedConnections[senderID]
-			if !exists {
-				// Initialize from active if first time
-				active := c.activeConnections[senderID]
-				current = ConnectionStaged{
-					SenderID:        &senderID,
-					MasterEnable:    active.MasterEnable,
-					Activation:      active.Activation,
-					TransportParams: active.TransportParams,
-				}
-			}
-
-			// Apply patch (partial update)
-			// Note: Booleans are tricky with partial updates in JSON if we want to detect omission vs false.
-			// For simplicity here, we assume if it's in the patch, it's intended.
-			// A more robust way would be to use pointers or a map[string]interface{}.
-			current.MasterEnable = patch.MasterEnable
-			
-			if patch.Activation.Mode != "" {
-				current.Activation = patch.Activation
-			}
-			if len(patch.TransportParams) > 0 {
-				current.TransportParams = patch.TransportParams
-			}
-
-			c.stagedConnections[senderID] = current
-
-			// Handle Activation
-			if current.Activation.Mode == ActivationModeImmediate {
-				// Perform activation
-				now := time.Now()
-				nowStr := fmt.Sprintf("%d:%d", now.Unix(), now.Nanosecond())
-				current.Activation.ActivationTime = &nowStr
-
-				active := ConnectionActive{
-					SenderID:        current.SenderID,
-					MasterEnable:    current.MasterEnable,
-					Activation:      current.Activation,
-					TransportParams: current.TransportParams,
-				}
-				c.activeConnections[senderID] = active
-				
-				// Reset staged activation mode after use
-				current.Activation.Mode = ActivationModeNull
-				c.stagedConnections[senderID] = current
-
-				slog.Info("Activated staged parameters", "senderID", senderID)
-			}
-			c.mu.Unlock()
-
-			json.NewEncoder(w).Encode(current)
-			return
 		}
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 
-	case "constraints":
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
+		current.MasterEnable = patch.MasterEnable
+		if patch.Activation.Mode != "" {
+			current.Activation = patch.Activation
 		}
-		json.NewEncoder(w).Encode([]interface{}{})
+		if len(patch.TransportParams) > 0 {
+			current.TransportParams = patch.TransportParams
+		}
 
-	case "transportfile":
-		// TODO: Implement transport file generation (SDP for RTP)
-		http.Error(w, "Not implemented", http.StatusNotImplemented)
+		if current.Activation.Mode == ActivationModeImmediate {
+			now := time.Now()
+			nowStr := fmt.Sprintf("%d:%d", now.Unix(), now.Nanosecond())
+			current.Activation.ActivationTime = &nowStr
+
+			active := ConnectionActive{
+				SenderID:        current.SenderID,
+				MasterEnable:    current.MasterEnable,
+				Activation:      current.Activation,
+				TransportParams: current.TransportParams,
+			}
+			c.activeConnections[senderID] = active
+			current.Activation.Mode = ActivationModeNull
+		}
+		c.stagedConnections[senderID] = current
+		c.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(current)
 
 	default:
-		http.NotFound(w, r)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
+func (c *nmosController) handleConnectionSenderConstraints(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode([]interface{}{})
+}

@@ -23,11 +23,13 @@ type Gateway interface {
 type shureDeviceInfo struct {
 	ctrl          infrastructure.ShureController
 	lastSeen      time.Time
-	nmosDeviceIDs map[int]string            // channel -> deviceID
-	parameterOIDs map[string]int            // param_key -> oid (e.g. "1_AUDIO_GAIN" -> 101)
-	sourceIDs     map[int]map[string]string // channel -> param -> sourceID
-	flowIDs       map[int]map[string]string // channel -> param -> flowID
-	senderIDs     map[int]map[string]string // channel -> param -> senderID
+	modelFamily   infrastructure.ShureModelFamily // Detected model family
+	nmosDeviceIDs map[int]string                  // channel -> deviceID
+	deviceOID     int                             // OID of the device block in NCP tree
+	parameterOIDs map[string]int                  // param_key -> oid (e.g. "1_AUDIO_GAIN" -> 101)
+	sourceIDs     map[int]map[string]string       // channel -> param -> sourceID
+	flowIDs       map[int]map[string]string       // channel -> param -> flowID
+	senderIDs     map[int]map[string]string       // channel -> param -> senderID
 }
 
 // gatewayImpl is the concrete implementation of the Gateway interface
@@ -131,10 +133,12 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 	}
 
 	deviceID := uuid.New().String()
+	deviceOID := 100 + (len(g.shureCtrls)+1)*10
 	g.shureCtrls[addr] = &shureDeviceInfo{
 		ctrl:          ctrl,
 		lastSeen:      time.Now(),
 		nmosDeviceIDs: map[int]string{0: deviceID},
+		deviceOID:     deviceOID,
 		parameterOIDs: make(map[string]int),
 		sourceIDs:     make(map[int]map[string]string),
 		flowIDs:       make(map[int]map[string]string),
@@ -149,15 +153,39 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 	go func() {
 		time.Sleep(500 * time.Millisecond)
 		slog.Info("Requesting full device discovery", "address", addr)
+
+		// 1. Get device-level parameters (channel 0 with ALL)
 		ctrl.SendCommand(infrastructure.GetAllCommand(0))
 
-		// Set METER_RATE to 1000ms (1 second) for all channels to start periodic sampling
 		time.Sleep(100 * time.Millisecond)
-		ctrl.SendCommand(fmt.Sprintf("< SET 0 METER_RATE 01000 >\n"))
 
-		// Start SAMPLE ALL for all channels to receive metered values
-		time.Sleep(100 * time.Millisecond)
-		ctrl.SendCommand(fmt.Sprintf("< SAMPLE 0 ALL >\n"))
+		// 2. Query channel-specific parameters for channels 1-4 (channel 0 is device level, not audio)
+		channelParams := []string{
+			"AUDIO_GAIN", "AUDIO_MUTE", "CHAN_NAME",
+			"FREQUENCY", "GROUP_CHANNEL", "FD_MODE",
+		}
+
+		for ch := 1; ch <= 4; ch++ {
+			for _, param := range channelParams {
+				ctrl.SendCommand(infrastructure.NewShureCommand("GET").
+					WithIndex(ch).
+					WithParam(param, nil).
+					Build())
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		// 3. Set METER_RATE to 1000ms for all channels 1-4
+		for ch := 1; ch <= 4; ch++ {
+			ctrl.SendCommand(fmt.Sprintf("< SET %d METER_RATE 01000 >\n", ch))
+			time.Sleep(20 * time.Millisecond)
+		}
+
+		// 4. Start SAMPLE ALL for channels 1-4
+		for ch := 1; ch <= 4; ch++ {
+			ctrl.SendCommand(fmt.Sprintf("< SAMPLE %d ALL >\n", ch))
+			time.Sleep(20 * time.Millisecond)
+		}
 	}()
 
 	// Initial NMOS Registration
@@ -187,10 +215,16 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 	})
 
 	// Register Sources, Flows and Senders for up to 4 channels
+	// FD parameters (Frequency Diversity) added for Axient Digital
+	// Battery telemetry added for all model families
 	meteredParams := []string{
 		"CHAN_QUALITY", "AUDIO_LED_BITMAP", "AUDIO_LEVEL_PEAK", "AUDIO_LEVEL_RMS",
 		"ANTENNA_STATUS", "RF_LED_BITMAP_A", "RF_RSSI_A", "RF_LED_BITMAP_B", "RF_RSSI_B",
 		"RF_LED_BITMAP_C", "RF_RSSI_C", "RF_LED_BITMAP_D", "RF_RSSI_D",
+		"RF_LED_BITMAP_F1", "RF_RSSI_F1", "RF_LED_BITMAP_F2", "RF_RSSI_F2",
+		"TX_BATT_BARS", "TX_BATT_CHARGE_PERCENT", "TX_BATT_MINS", "TX_BATT_TEMP_C",
+		"TX_BATT_CYCLE_COUNT", "TX_BATT_HEALTH_PERCENT",
+		"RF_LEVEL", "AUDIO_PEAK", "AUDIO_RMS", "RF_RSSI",
 	}
 
 	for i := 1; i <= 4; i++ {
@@ -203,7 +237,7 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 			sourceID := uuid.New().String()
 			flowID := uuid.New().String()
 			senderID := uuid.New().String()
-			
+
 			// Normalize param key (to lower case for internal lookups if needed, or keep upper for consistency with Shure)
 			// Let's keep upper case key for consistency with Shure param names
 			g.shureCtrls[addr].sourceIDs[i][param] = sourceID
@@ -241,17 +275,23 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 				"event_type":  eventType,
 			})
 
-			// Register Sender (IS-04)
+			// Register Sender (IS-04) with IS-05/IS-07 transport parameters
 			g.nmosCtrl.RegisterResource("senders", map[string]interface{}{
-				"id":          senderID,
-				"version":     fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond()),
-				"label":       fmt.Sprintf("%s Channel %d %s Sender", dev.Instance, i, param),
-				"description": fmt.Sprintf("IS-07 event sender for %s on Channel %d", param, i),
-				"device_id":   deviceID,
-				"flow_id":     flowID,
-				"transport":   "urn:x-nmos:transport:websocket",
+				"id":                 senderID,
+				"version":            fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond()),
+				"label":              fmt.Sprintf("%s Channel %d %s Sender", dev.Instance, i, param),
+				"description":        fmt.Sprintf("IS-07 event sender for %s on Channel %d", param, i),
+				"device_id":          deviceID,
+				"flow_id":            flowID,
+				"transport":          "urn:x-nmos:transport:websocket",
 				"interface_bindings": []string{"eth0"},
 				"manifest_href":      nil,
+				"transport_params": []map[string]interface{}{
+					{
+						"ext_is_07_rest_api_url": fmt.Sprintf("http://%s/x-nmos/events/v1.0/sources/%s/", g.nmosAddr, sourceID),
+						"ext_is_07_source_id":    sourceID,
+					},
+				},
 			})
 		}
 	}
@@ -276,7 +316,6 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 	})
 
 	// Use a simple OID allocation (In a real app, this should be more robust)
-	deviceOID := 100 + len(g.shureCtrls)*10
 	devBlock := infrastructure.NewNcBlock(deviceOID, nil, "Device", dev.Instance)
 	g.nmosCtrl.RegisterNCPObject(deviceOID, devBlock)
 
@@ -373,7 +412,13 @@ func getNMOSEventType(param string) string {
 	switch param {
 	case "AUDIO_MUTE", "MUTE":
 		return "boolean"
-	case "AUDIO_GAIN", "AUDIO_LEVEL_PEAK", "AUDIO_LEVEL_RMS", "RSSI", "RF_RSSI_A", "RF_RSSI_B", "CHAN_QUALITY":
+	case "AUDIO_GAIN", "AUDIO_LEVEL_PEAK", "AUDIO_LEVEL_RMS", "CHAN_QUALITY",
+		"RF_RSSI", "RF_RSSI_A", "RF_RSSI_B", "RF_RSSI_C", "RF_RSSI_D",
+		"RF_RSSI_F1", "RF_RSSI_F2", "RF_LEVEL",
+		"TX_BATT_BARS", "TX_BATT_CHARGE_PERCENT", "TX_BATT_MINS", "TX_BATT_TEMP_C",
+		"TX_BATT_CYCLE_COUNT", "TX_BATT_HEALTH_PERCENT",
+		"AUDIO_LED_BITMAP", "RF_LED_BITMAP_A", "RF_LED_BITMAP_B",
+		"RF_LED_BITMAP_C", "RF_LED_BITMAP_D", "RF_LED_BITMAP_F1", "RF_LED_BITMAP_F2":
 		return "number"
 	default:
 		return "string"
@@ -402,49 +447,116 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 
 	// IS-07 (Events) Logic
 	if report.Type == "SAMPLE" && report.Param == "ALL" {
-		vals := strings.Fields(report.Value)
-		if len(vals) >= 9 {
-			if sID, ok := info.sourceIDs[report.Channel]["CHAN_QUALITY"]; ok {
-				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["CHAN_QUALITY"], "number", vals[0])
-			}
-			if sID, ok := info.sourceIDs[report.Channel]["AUDIO_LED_BITMAP"]; ok {
-				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["AUDIO_LED_BITMAP"], "string", vals[1])
-			}
-			if sID, ok := info.sourceIDs[report.Channel]["AUDIO_LEVEL_PEAK"]; ok {
-				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["AUDIO_LEVEL_PEAK"], "number", vals[2])
-			}
-			if sID, ok := info.sourceIDs[report.Channel]["AUDIO_LEVEL_RMS"]; ok {
-				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["AUDIO_LEVEL_RMS"], "number", vals[3])
-			}
-			if sID, ok := info.sourceIDs[report.Channel]["ANTENNA_STATUS"]; ok {
-				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["ANTENNA_STATUS"], "string", vals[4])
-			}
-			if sID, ok := info.sourceIDs[report.Channel]["RF_LED_BITMAP_A"]; ok {
-				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_LED_BITMAP_A"], "string", vals[5])
-			}
-			if sID, ok := info.sourceIDs[report.Channel]["RF_RSSI_A"]; ok {
-				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_RSSI_A"], "number", vals[6])
-			}
-			if sID, ok := info.sourceIDs[report.Channel]["RF_LED_BITMAP_B"]; ok {
-				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_LED_BITMAP_B"], "string", vals[7])
-			}
-			if sID, ok := info.sourceIDs[report.Channel]["RF_RSSI_B"]; ok {
-				g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_RSSI_B"], "number", vals[8])
-			}
-			
-			// If it's Quadversity, there are more
-			if len(vals) >= 13 {
-				if sID, ok := info.sourceIDs[report.Channel]["RF_LED_BITMAP_C"]; ok {
-					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_LED_BITMAP_C"], "string", vals[9])
+		// Use specialized parsers based on detected model family
+		switch info.modelFamily {
+		case infrastructure.ModelFamilyAxientDigital:
+			if sample := infrastructure.ParseSampleReport(report.Raw); sample != nil {
+				if sID, ok := info.sourceIDs[report.Channel]["CHAN_QUALITY"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["CHAN_QUALITY"], "number", sample.Quality)
 				}
-				if sID, ok := info.sourceIDs[report.Channel]["RF_RSSI_C"]; ok {
-					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_RSSI_C"], "number", vals[10])
+				if sID, ok := info.sourceIDs[report.Channel]["AUDIO_LED_BITMAP"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["AUDIO_LED_BITMAP"], "number", sample.AudioLEDBitmap)
 				}
-				if sID, ok := info.sourceIDs[report.Channel]["RF_LED_BITMAP_D"]; ok {
-					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_LED_BITMAP_D"], "string", vals[11])
+				if sID, ok := info.sourceIDs[report.Channel]["AUDIO_LEVEL_PEAK"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["AUDIO_LEVEL_PEAK"], "number", sample.AudioLevelPeakDBFS())
 				}
-				if sID, ok := info.sourceIDs[report.Channel]["RF_RSSI_D"]; ok {
-					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_RSSI_D"], "number", vals[12])
+				if sID, ok := info.sourceIDs[report.Channel]["AUDIO_LEVEL_RMS"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["AUDIO_LEVEL_RMS"], "number", sample.AudioLevelRMSDBFS())
+				}
+				if sID, ok := info.sourceIDs[report.Channel]["ANTENNA_STATUS"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["ANTENNA_STATUS"], "string", sample.RFAntStatus)
+				}
+				if sID, ok := info.sourceIDs[report.Channel]["RF_LED_BITMAP_A"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_LED_BITMAP_A"], "number", sample.RFBitmapA)
+				}
+				if sID, ok := info.sourceIDs[report.Channel]["RF_RSSI_A"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_RSSI_A"], "number", sample.RFRSSI_A_DBM())
+				}
+				if sID, ok := info.sourceIDs[report.Channel]["RF_LED_BITMAP_B"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_LED_BITMAP_B"], "number", sample.RFBitmapB)
+				}
+				if sID, ok := info.sourceIDs[report.Channel]["RF_RSSI_B"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_RSSI_B"], "number", sample.RFRSSI_B_DBM())
+				}
+				// Quadversity (4 antennas)
+				if sample.RFBitmapC > 0 || sample.RFRSSI_C > 0 {
+					if sID, ok := info.sourceIDs[report.Channel]["RF_LED_BITMAP_C"]; ok {
+						g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_LED_BITMAP_C"], "number", sample.RFBitmapC)
+					}
+					if sID, ok := info.sourceIDs[report.Channel]["RF_RSSI_C"]; ok {
+						g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_RSSI_C"], "number", sample.RFRSSI_C_DBM())
+					}
+					if sID, ok := info.sourceIDs[report.Channel]["RF_LED_BITMAP_D"]; ok {
+						g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_LED_BITMAP_D"], "number", sample.RFBitmapD)
+					}
+					if sID, ok := info.sourceIDs[report.Channel]["RF_RSSI_D"]; ok {
+						g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_RSSI_D"], "number", sample.RFRSSI_D_DBM())
+					}
+				}
+				// Frequency Diversity (F1/F2)
+				if sample.RFBitmapF1 > 0 || sample.RFRSSI_F1 > 0 {
+					if sID, ok := info.sourceIDs[report.Channel]["RF_LED_BITMAP_F1"]; ok {
+						g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_LED_BITMAP_F1"], "number", sample.RFBitmapF1)
+					}
+					if sID, ok := info.sourceIDs[report.Channel]["RF_RSSI_F1"]; ok {
+						g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_RSSI_F1"], "number", sample.RFRSSI_F1_DBM())
+					}
+				}
+				if sample.RFBitmapF2 > 0 || sample.RFRSSI_F2 > 0 {
+					if sID, ok := info.sourceIDs[report.Channel]["RF_LED_BITMAP_F2"]; ok {
+						g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_LED_BITMAP_F2"], "number", sample.RFBitmapF2)
+					}
+					if sID, ok := info.sourceIDs[report.Channel]["RF_RSSI_F2"]; ok {
+						g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_RSSI_F2"], "number", sample.RFRSSI_F2_DBM())
+					}
+				}
+			}
+		case infrastructure.ModelFamilyULXD, infrastructure.ModelFamilyQLXD:
+			if sample := infrastructure.ParseULXDSampleReport(report.Raw); sample != nil {
+				if sID, ok := info.sourceIDs[report.Channel]["ANTENNA_STATUS"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["ANTENNA_STATUS"], "string", string(sample.AntStatus))
+				}
+				if sID, ok := info.sourceIDs[report.Channel]["RF_LEVEL"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_LEVEL"], "number", sample.RFLevelDBM())
+				}
+				if sID, ok := info.sourceIDs[report.Channel]["AUDIO_LEVEL_PEAK"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["AUDIO_LEVEL_PEAK"], "number", sample.AudioLevelDBFS())
+				}
+				if sID, ok := info.sourceIDs[report.Channel]["AUDIO_LEVEL_RMS"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["AUDIO_LEVEL_RMS"], "number", sample.AudioLevelDBFS())
+				}
+			}
+		case infrastructure.ModelFamilySLXD, infrastructure.ModelFamilySLXDPlus:
+			if sample := infrastructure.ParseSLDXSampleReport(report.Raw); sample != nil {
+				if sID, ok := info.sourceIDs[report.Channel]["AUDIO_LEVEL_PEAK"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["AUDIO_LEVEL_PEAK"], "number", sample.AudioPeakDBFS())
+				}
+				if sID, ok := info.sourceIDs[report.Channel]["AUDIO_LEVEL_RMS"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["AUDIO_LEVEL_RMS"], "number", sample.AudioRMSDBFS())
+				}
+				if sID, ok := info.sourceIDs[report.Channel]["RF_RSSI"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_RSSI"], "number", sample.RFRSSIDBM())
+				}
+			}
+		default:
+			// Fallback: detect format automatically
+			format := infrastructure.DetectSampleFormat(report.Raw)
+			switch format {
+			case "axient":
+				// Re-parse as Axient
+				if sample := infrastructure.ParseSampleReport(report.Raw); sample != nil {
+					info.modelFamily = infrastructure.ModelFamilyAxientDigital
+					g.handleAxientSampleEvents(info, report.Channel, sample)
+				}
+			case "ulxd":
+				if sample := infrastructure.ParseULXDSampleReport(report.Raw); sample != nil {
+					info.modelFamily = infrastructure.ModelFamilyULXD
+					g.handleULXDSampleEvents(info, report.Channel, sample)
+				}
+			case "sldx":
+				if sample := infrastructure.ParseSLDXSampleReport(report.Raw); sample != nil {
+					info.modelFamily = infrastructure.ModelFamilySLXD
+					g.handleSLDXSampleEvents(info, report.Channel, sample)
 				}
 			}
 		}
@@ -461,14 +573,14 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 		paramKey := fmt.Sprintf("%d_%s", report.Channel, report.Param)
 		g.mu.Lock()
 		oid, exists := info.parameterOIDs[paramKey]
-		
+
 		// Decide if we should create a worker for this parameter
 		// We avoid purely informational or transient parameters
-		shouldCreateWorker := !exists && 
-			report.Param != "METER_RATE" && 
-			report.Param != "SAMPLE" && 
+		shouldCreateWorker := !exists &&
+			report.Param != "METER_RATE" &&
+			report.Param != "SAMPLE" &&
 			report.Param != "FLASH"
-			
+
 		if shouldCreateWorker {
 			// Allocate a new OID for this parameter
 			oid = 1000 + len(info.parameterOIDs) + (len(g.shureCtrls) * 100)
@@ -498,8 +610,7 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 			g.nmosCtrl.RegisterNCPObject(oid, worker)
 
 			// Add to Device Block
-			deviceOID := 100 + (len(g.shureCtrls)-1)*10 // Approximate device OID
-			if devObj := g.nmosCtrl.GetNCPObject(deviceOID); devObj != nil {
+			if devObj := g.nmosCtrl.GetNCPObject(info.deviceOID); devObj != nil {
 				if db, ok := devObj.(*infrastructure.NcBlock); ok {
 					db.AddItem(oid)
 				}
@@ -537,6 +648,14 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 		// Handle different parameters for tags
 		if report.Param == "MODEL" {
 			res["description"] = fmt.Sprintf("%s at %s", report.Value, msg.Source)
+			// Detect and store model family
+			family := infrastructure.DetectModelFamily(report.Value)
+			g.mu.Lock()
+			if info, ok := g.shureCtrls[msg.Source]; ok {
+				info.modelFamily = family
+				slog.Info("Detected Shure model family", "address", msg.Source, "model", report.Value, "family", family)
+			}
+			g.mu.Unlock()
 		}
 
 		if report.Param == "DEVICE_ID" {
@@ -598,6 +717,93 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 func (g *gatewayImpl) handleNMOSNode(msg infrastructure.Message) {
 	// Implementation would translate NMOS node/device/resource to Shure device state
 	// For now, this is a placeholder
+}
+
+func (g *gatewayImpl) handleAxientSampleEvents(info *shureDeviceInfo, channel int, sample *infrastructure.SampleReport) {
+	if sID, ok := info.sourceIDs[channel]["CHAN_QUALITY"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["CHAN_QUALITY"], "number", sample.Quality)
+	}
+	if sID, ok := info.sourceIDs[channel]["AUDIO_LED_BITMAP"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["AUDIO_LED_BITMAP"], "number", sample.AudioLEDBitmap)
+	}
+	if sID, ok := info.sourceIDs[channel]["AUDIO_LEVEL_PEAK"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["AUDIO_LEVEL_PEAK"], "number", sample.AudioLevelPeakDBFS())
+	}
+	if sID, ok := info.sourceIDs[channel]["AUDIO_LEVEL_RMS"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["AUDIO_LEVEL_RMS"], "number", sample.AudioLevelRMSDBFS())
+	}
+	if sID, ok := info.sourceIDs[channel]["ANTENNA_STATUS"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["ANTENNA_STATUS"], "string", sample.RFAntStatus)
+	}
+	if sID, ok := info.sourceIDs[channel]["RF_LED_BITMAP_A"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_LED_BITMAP_A"], "number", sample.RFBitmapA)
+	}
+	if sID, ok := info.sourceIDs[channel]["RF_RSSI_A"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_RSSI_A"], "number", sample.RFRSSI_A_DBM())
+	}
+	if sID, ok := info.sourceIDs[channel]["RF_LED_BITMAP_B"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_LED_BITMAP_B"], "number", sample.RFBitmapB)
+	}
+	if sID, ok := info.sourceIDs[channel]["RF_RSSI_B"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_RSSI_B"], "number", sample.RFRSSI_B_DBM())
+	}
+	if sample.RFBitmapC > 0 || sample.RFRSSI_C > 0 {
+		if sID, ok := info.sourceIDs[channel]["RF_LED_BITMAP_C"]; ok {
+			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_LED_BITMAP_C"], "number", sample.RFBitmapC)
+		}
+		if sID, ok := info.sourceIDs[channel]["RF_RSSI_C"]; ok {
+			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_RSSI_C"], "number", sample.RFRSSI_C_DBM())
+		}
+		if sID, ok := info.sourceIDs[channel]["RF_LED_BITMAP_D"]; ok {
+			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_LED_BITMAP_D"], "number", sample.RFBitmapD)
+		}
+		if sID, ok := info.sourceIDs[channel]["RF_RSSI_D"]; ok {
+			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_RSSI_D"], "number", sample.RFRSSI_D_DBM())
+		}
+	}
+	if sample.RFBitmapF1 > 0 || sample.RFRSSI_F1 > 0 {
+		if sID, ok := info.sourceIDs[channel]["RF_LED_BITMAP_F1"]; ok {
+			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_LED_BITMAP_F1"], "number", sample.RFBitmapF1)
+		}
+		if sID, ok := info.sourceIDs[channel]["RF_RSSI_F1"]; ok {
+			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_RSSI_F1"], "number", sample.RFRSSI_F1_DBM())
+		}
+	}
+	if sample.RFBitmapF2 > 0 || sample.RFRSSI_F2 > 0 {
+		if sID, ok := info.sourceIDs[channel]["RF_LED_BITMAP_F2"]; ok {
+			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_LED_BITMAP_F2"], "number", sample.RFBitmapF2)
+		}
+		if sID, ok := info.sourceIDs[channel]["RF_RSSI_F2"]; ok {
+			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_RSSI_F2"], "number", sample.RFRSSI_F2_DBM())
+		}
+	}
+}
+
+func (g *gatewayImpl) handleULXDSampleEvents(info *shureDeviceInfo, channel int, sample *infrastructure.ULXDSampleReport) {
+	if sID, ok := info.sourceIDs[channel]["ANTENNA_STATUS"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["ANTENNA_STATUS"], "string", string(sample.AntStatus))
+	}
+	if sID, ok := info.sourceIDs[channel]["RF_LEVEL"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_LEVEL"], "number", sample.RFLevelDBM())
+	}
+	if sID, ok := info.sourceIDs[channel]["AUDIO_LEVEL_PEAK"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["AUDIO_LEVEL_PEAK"], "number", sample.AudioLevelDBFS())
+	}
+	if sID, ok := info.sourceIDs[channel]["AUDIO_LEVEL_RMS"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["AUDIO_LEVEL_RMS"], "number", sample.AudioLevelDBFS())
+	}
+}
+
+func (g *gatewayImpl) handleSLDXSampleEvents(info *shureDeviceInfo, channel int, sample *infrastructure.SLDXSampleReport) {
+	if sID, ok := info.sourceIDs[channel]["AUDIO_LEVEL_PEAK"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["AUDIO_LEVEL_PEAK"], "number", sample.AudioPeakDBFS())
+	}
+	if sID, ok := info.sourceIDs[channel]["AUDIO_LEVEL_RMS"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["AUDIO_LEVEL_RMS"], "number", sample.AudioRMSDBFS())
+	}
+	if sID, ok := info.sourceIDs[channel]["RF_RSSI"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_RSSI"], "number", sample.RFRSSIDBM())
+	}
 }
 
 // reapStaleDevices periodically removes devices that haven't been seen recently
