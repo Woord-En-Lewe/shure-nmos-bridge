@@ -3,327 +3,344 @@ package infrastructure
 import (
 	"encoding/json"
 	"fmt"
-	"reflect"
+
+	"github.com/Woord-En-Lewe/shure-nmos-bridge/internal/nca"
 )
 
-// BaseNcObject provides a default implementation of NcObject
-type BaseNcObject struct {
-	OID         int
-	ClassID     []int
-	ConstantOID bool
-	Owner       *int
-	Role        string
-	UserLabel   string
-	Notify      func(oid int, eventID NCPEventID, data interface{})
-}
+// Adapter functions to convert between nca types and NCP types
 
-func (o *BaseNcObject) SetNotifyCallback(cb func(oid int, eventID NCPEventID, data interface{})) {
-	o.Notify = cb
-}
-
-func (o *BaseNcObject) GetOID() int {
-	return o.OID
-}
-
-func (o *BaseNcObject) GetClassID() []int {
-	return o.ClassID
-}
-
-func (o *BaseNcObject) GetProperty(id NCPPropertyID) (interface{}, error) {
-	switch id {
-	case NCPropertyClassID:
-		return o.ClassID, nil
-	case NCPropertyOID:
-		return o.OID, nil
-	case NCPropertyConstantOID:
-		return o.ConstantOID, nil
-	case NCPropertyOwner:
-		return o.Owner, nil
-	case NCPropertyRole:
-		return o.Role, nil
-	case NCPropertyUserLabel:
-		return o.UserLabel, nil
-	default:
-		return nil, fmt.Errorf("property %d:%d not found", id.Level, id.Index)
-	}
-}
-
-func (o *BaseNcObject) SetProperty(id NCPPropertyID, value interface{}) error {
-	switch id {
-	case NCPropertyUserLabel:
-		if val, ok := value.(string); ok {
-			o.UserLabel = val
-			if o.Notify != nil {
-				o.Notify(o.OID, NCPEventID{1, 1}, PropertyChangedEventData{
-					PropertyID: id,
-					ChangeType: 0,
-					Value:      val,
-				})
-			}
-			return nil
-		}
-		return fmt.Errorf("invalid type for UserLabel")
-	default:
-		return fmt.Errorf("property %d:%d not found or read-only", id.Level, id.Index)
-	}
-}
-
-func (o *BaseNcObject) InvokeMethod(id NCPMethodID, args json.RawMessage) (interface{}, error) {
-	return nil, fmt.Errorf("method %d:%d not implemented", id.Level, id.Index)
-}
-
-func (o *BaseNcObject) GetDescriptor() NcBlockMemberDescriptor {
+// blockMemberDescriptorToNcBlockMemberDescriptor converts nca.BlockMemberDescriptor to NcBlockMemberDescriptor
+func blockMemberDescriptorToNcBlockMemberDescriptor(d nca.BlockMemberDescriptor) NcBlockMemberDescriptor {
 	return NcBlockMemberDescriptor{
-		Role:        o.Role,
-		OID:         o.OID,
-		ConstantOID: o.ConstantOID,
-		ClassID:     o.ClassID,
-		UserLabel:   o.UserLabel,
-		Owner:       o.Owner,
+		Role:        d.Role,
+		OID:         d.OID,
+		ConstantOID: d.ConstantOID,
+		ClassID:     d.ClassID,
+		UserLabel:   d.UserLabel,
+		Owner:       d.Owner,
+		Description: d.Description,
 	}
 }
 
-// NcBlock represents an NMOS Control Block
+// NcBlockMemberDescriptorToBlockMemberDescriptor converts NcBlockMemberDescriptor to nca.BlockMemberDescriptor
+func NcBlockMemberDescriptorToBlockMemberDescriptor(d NcBlockMemberDescriptor) nca.BlockMemberDescriptor {
+	return nca.BlockMemberDescriptor{
+		Role:        d.Role,
+		OID:         d.OID,
+		ConstantOID: d.ConstantOID,
+		ClassID:     d.ClassID,
+		UserLabel:   d.UserLabel,
+		Owner:       d.Owner,
+		Description: d.Description,
+	}
+}
+
+// NcClassDescriptorToClassDescriptor converts NcClassDescriptor to nca.ClassDescriptor
+func NcClassDescriptorToClassDescriptor(d NcClassDescriptor) nca.ClassDescriptor {
+	props := make([]nca.PropertyDescriptor, len(d.Properties))
+	for i, p := range d.Properties {
+		props[i] = nca.PropertyDescriptor{
+			ID:           nca.PropertyID(p.ID),
+			Name:         p.Name,
+			TypeName:     p.TypeName,
+			IsReadOnly:   p.IsReadOnly,
+			IsNullable:   p.IsNullable,
+			IsSequence:   p.IsSequence,
+			IsDeprecated: p.IsDeprecated,
+		}
+	}
+	methods := make([]nca.MethodDescriptor, len(d.Methods))
+	for i, m := range d.Methods {
+		params := make([]nca.ParameterDescriptor, len(m.Parameters))
+		for j, p := range m.Parameters {
+			params[j] = nca.ParameterDescriptor{
+				Name:       p.Name,
+				TypeName:   p.TypeName,
+				IsNullable: p.IsNullable,
+				IsSequence: p.IsSequence,
+			}
+		}
+		methods[i] = nca.MethodDescriptor{
+			ID:             nca.MethodID(m.ID),
+			Name:           m.Name,
+			ResultDatatype: m.ResultDatatype,
+			Parameters:     params,
+			IsDeprecated:   m.IsDeprecated,
+		}
+	}
+	events := make([]nca.EventDescriptor, len(d.Events))
+	for i, e := range d.Events {
+		events[i] = nca.EventDescriptor{
+			ID:            nca.EventID(e.ID),
+			Name:          e.Name,
+			EventDatatype: e.EventDatatype,
+			IsDeprecated:  e.IsDeprecated,
+		}
+	}
+	var fixedRole *string
+	if d.FixedRole != nil {
+		fixedRole = new(string)
+		*fixedRole = *d.FixedRole
+	}
+	return nca.ClassDescriptor{
+		ClassID:    d.ClassID,
+		Name:       d.Name,
+		FixedRole:  fixedRole,
+		Properties: props,
+		Methods:    methods,
+		Events:     events,
+	}
+}
+
+// ClassDescriptorToNcClassDescriptor converts nca.ClassDescriptor to NcClassDescriptor
+func ClassDescriptorToNcClassDescriptor(d nca.ClassDescriptor) NcClassDescriptor {
+	props := make([]NcPropertyDescriptor, len(d.Properties))
+	for i, p := range d.Properties {
+		props[i] = NcPropertyDescriptor{
+			ID:           NCPPropertyID(p.ID),
+			Name:         p.Name,
+			TypeName:     p.TypeName,
+			IsReadOnly:   p.IsReadOnly,
+			IsNullable:   p.IsNullable,
+			IsSequence:   p.IsSequence,
+			IsDeprecated: p.IsDeprecated,
+		}
+	}
+	methods := make([]NcMethodDescriptor, len(d.Methods))
+	for i, m := range d.Methods {
+		params := make([]NcParameterDescriptor, len(m.Parameters))
+		for j, p := range m.Parameters {
+			params[j] = NcParameterDescriptor{
+				Name:       p.Name,
+				TypeName:   p.TypeName,
+				IsNullable: p.IsNullable,
+				IsSequence: p.IsSequence,
+			}
+		}
+		methods[i] = NcMethodDescriptor{
+			ID:             NCPMethodID(m.ID),
+			Name:           m.Name,
+			ResultDatatype: m.ResultDatatype,
+			Parameters:     params,
+			IsDeprecated:   m.IsDeprecated,
+		}
+	}
+	events := make([]NcEventDescriptor, len(d.Events))
+	for i, e := range d.Events {
+		events[i] = NcEventDescriptor{
+			ID:            NCPEventID(e.ID),
+			Name:          e.Name,
+			EventDatatype: e.EventDatatype,
+			IsDeprecated:  e.IsDeprecated,
+		}
+	}
+	var fixedRole *string
+	if d.FixedRole != nil {
+		fixedRole = new(string)
+		*fixedRole = *d.FixedRole
+	}
+	return NcClassDescriptor{
+		ClassID:    d.ClassID,
+		Name:       d.Name,
+		FixedRole:  fixedRole,
+		Properties: props,
+		Methods:    methods,
+		Events:     events,
+	}
+}
+
+// NcBlock wraps nca.Block to implement the NcObject interface
+// This allows the nca library Block to be used in IS-12 NCP contexts
 type NcBlock struct {
-	BaseNcObject
-	Items    []int // OIDs of items in this block
-	Resolver func(oid int) NcObject
+	*nca.Block
 }
 
 func NewNcBlock(oid int, owner *int, role, label string) *NcBlock {
 	return &NcBlock{
-		BaseNcObject: BaseNcObject{
-			OID:         oid,
-			ClassID:     []int{1, 1}, // NcBlock
-			ConstantOID: true,
-			Owner:       owner,
-			Role:        role,
-			UserLabel:   label,
-		},
-		Items: []int{},
+		Block: nca.NewBlock(oid, owner, role, label),
 	}
+}
+
+func (b *NcBlock) GetOID() int {
+	return b.Block.GetOID()
+}
+
+func (b *NcBlock) GetClassID() []int {
+	return b.Block.GetClassID()
+}
+
+func (b *NcBlock) GetRole() string {
+	return b.Block.GetRole()
+}
+
+func (b *NcBlock) GetDescriptor() NcBlockMemberDescriptor {
+	return blockMemberDescriptorToNcBlockMemberDescriptor(b.Block.GetDescriptor())
+}
+
+func (b *NcBlock) SetNotifyCallback(cb func(oid int, eventID NCPEventID, eventData PropertyChangedEventData)) {
+	b.Block.SetNotifyCallback(func(oid int, eventID nca.EventID, eventData nca.PropertyChangedData) {
+		cb(oid, NCPEventID(eventID), PropertyChangedEventData(eventData))
+	})
 }
 
 func (b *NcBlock) GetProperty(id NCPPropertyID) (interface{}, error) {
-	if id.Level == 2 {
-		switch id.Index {
-		case 1: // enabled
-			return true, nil
-		case 2: // members
-			descriptors := make([]NcBlockMemberDescriptor, 0, len(b.Items))
-			for _, itemOid := range b.Items {
-				if b.Resolver != nil {
-					if obj := b.Resolver(itemOid); obj != nil {
-						descriptors = append(descriptors, obj.GetDescriptor())
-					}
-				}
-			}
-			return descriptors, nil
-		}
-	}
-	return b.BaseNcObject.GetProperty(id)
+	return b.Block.GetProperty(nca.PropertyID(id))
 }
 
-func (b *NcBlock) AddItem(oid int) {
-	for _, item := range b.Items {
-		if item == oid {
-			return
-		}
-	}
-	b.Items = append(b.Items, oid)
+func (b *NcBlock) SetProperty(id NCPPropertyID, value interface{}) error {
+	return b.Block.SetProperty(nca.PropertyID(id), value)
 }
 
 func (b *NcBlock) InvokeMethod(id NCPMethodID, args json.RawMessage) (interface{}, error) {
-	// Method 1,1: GetItems (Wait, NcBlock method level 2?)
-	// According to MS-05-02, Block level 2 methods are:
-	// 2m1: GetMemberDescriptors
-	// 2m2: FindMembersByPath
-	// 2m3: FindMembersByRole
-	// 2m4: FindMembersByClassId
-	if id.Level == 2 && id.Index == 1 {
-		descriptors := make([]NcBlockMemberDescriptor, 0, len(b.Items))
-		for _, itemOid := range b.Items {
-			if b.Resolver != nil {
-				if obj := b.Resolver(itemOid); obj != nil {
-					descriptors = append(descriptors, obj.GetDescriptor())
-				}
-			}
-		}
-		return map[string]interface{}{"status": 200, "value": descriptors}, nil
-	}
-	return b.BaseNcObject.InvokeMethod(id, args)
+	return b.Block.InvokeMethod(nca.MethodID(id), args)
 }
 
-// NcClassManager handles class discovery (OID 3)
+func (b *NcBlock) AddItem(oid int) {
+	b.Block.AddItem(oid)
+}
+
+func (b *NcBlock) SetResolver(resolver func(oid int) NcObject) {
+	b.Block.SetResolver(func(oid int) nca.Object {
+		obj := resolver(oid)
+		if obj == nil {
+			return nil
+		}
+		return &ncpObjectAdapter{NcObject: obj}
+	})
+}
+
+func (b *NcBlock) GetItems() []int {
+	return b.Block.Items
+}
+
+// NcClassManager wraps nca.ClassManager to implement the NcObject interface
 type NcClassManager struct {
-	BaseNcObject
-	Classes map[string]NcClassDescriptor
+	*nca.ClassManager
 }
 
 func NewNcClassManager(oid int, owner *int) *NcClassManager {
-	m := &NcClassManager{
-		BaseNcObject: BaseNcObject{
-			OID:         oid,
-			ClassID:     []int{1, 3, 2}, // NcClassManager (1.3.2)
-			ConstantOID: true,
-			Owner:       owner,
-			Role:        "ClassManager",
-			UserLabel:   "Class Manager",
-		},
-		Classes: make(map[string]NcClassDescriptor),
+	return &NcClassManager{
+		ClassManager: nca.NewClassManager(oid, owner),
 	}
-	m.registerStandardClasses()
-	return m
 }
 
-func (m *NcClassManager) registerStandardClasses() {
-	// NcObject
-	m.Classes["1"] = NcClassDescriptor{
-		Name:    "NcObject",
-		ClassID: []int{1},
-		Properties: []NcPropertyDescriptor{
-			{Name: "classId", ID: NCPPropertyID{1, 1}, TypeName: "NcClassId", IsReadOnly: true},
-			{Name: "oid", ID: NCPPropertyID{1, 2}, TypeName: "NcOid", IsReadOnly: true},
-			{Name: "constantOid", ID: NCPPropertyID{1, 3}, TypeName: "NcBoolean", IsReadOnly: true},
-			{Name: "owner", ID: NCPPropertyID{1, 4}, TypeName: "NcOid", IsReadOnly: true, IsNullable: true},
-			{Name: "role", ID: NCPPropertyID{1, 5}, TypeName: "NcString", IsReadOnly: true},
-			{Name: "userLabel", ID: NCPPropertyID{1, 6}, TypeName: "NcString", IsNullable: true},
-		},
-		Methods: []NcMethodDescriptor{
-			{Name: "Get", ID: NCPMethodID{1, 1}, ResultDatatype: "NcMethodResultPropertyValue"},
-			{Name: "Set", ID: NCPMethodID{1, 2}, ResultDatatype: "NcMethodResult"},
-		},
-	}
+func (m *NcClassManager) GetOID() int {
+	return m.ClassManager.GetOID()
+}
 
-	// NcBlock
-	m.Classes["1.1"] = NcClassDescriptor{
-		Name:    "NcBlock",
-		ClassID: []int{1, 1},
-		Properties: []NcPropertyDescriptor{
-			{Name: "enabled", ID: NCPPropertyID{2, 1}, TypeName: "NcBoolean", IsReadOnly: true},
-			{Name: "members", ID: NCPPropertyID{2, 2}, TypeName: "NcBlockMemberDescriptor", IsReadOnly: true, IsSequence: true},
-		},
-		Methods: []NcMethodDescriptor{
-			{Name: "GetMemberDescriptors", ID: NCPMethodID{2, 1}, ResultDatatype: "NcMethodResultBlockMemberDescriptors"},
-		},
-	}
+func (m *NcClassManager) GetClassID() []int {
+	return m.ClassManager.GetClassID()
+}
 
-	// NcWorker
-	m.Classes["1.2"] = NcClassDescriptor{
-		Name:    "NcWorker",
-		ClassID: []int{1, 2},
-		Properties: []NcPropertyDescriptor{
-			{Name: "enabled", ID: NCPPropertyID{2, 1}, TypeName: "NcBoolean"},
-		},
-	}
+func (m *NcClassManager) GetRole() string {
+	return m.ClassManager.GetRole()
+}
 
-	// NcClassManager
-	m.Classes["1.3.2"] = NcClassDescriptor{
-		Name:    "NcClassManager",
-		ClassID: []int{1, 3, 2},
-		Properties: []NcPropertyDescriptor{
-			{Name: "controlClasses", ID: NCPPropertyID{3, 1}, TypeName: "NcClassDescriptor", IsReadOnly: true, IsSequence: true},
-			{Name: "datatypes", ID: NCPPropertyID{3, 2}, TypeName: "NcDatatypeDescriptor", IsReadOnly: true, IsSequence: true},
-		},
-		Methods: []NcMethodDescriptor{
-			{Name: "GetControlClass", ID: NCPMethodID{3, 1}, ResultDatatype: "NcMethodResultClassDescriptor"},
-		},
-	}
+func (m *NcClassManager) GetDescriptor() NcBlockMemberDescriptor {
+	return blockMemberDescriptorToNcBlockMemberDescriptor(m.ClassManager.GetDescriptor())
+}
+
+func (m *NcClassManager) SetNotifyCallback(cb func(oid int, eventID NCPEventID, eventData PropertyChangedEventData)) {
+	m.ClassManager.SetNotifyCallback(func(oid int, eventID nca.EventID, eventData nca.PropertyChangedData) {
+		cb(oid, NCPEventID(eventID), PropertyChangedEventData(eventData))
+	})
 }
 
 func (m *NcClassManager) GetProperty(id NCPPropertyID) (interface{}, error) {
-	if id.Level == 3 {
-		switch id.Index {
-		case 1: // controlClasses
-			classes := make([]NcClassDescriptor, 0, len(m.Classes))
-			for _, c := range m.Classes {
-				classes = append(classes, c)
-			}
-			return classes, nil
-		case 2: // datatypes
-			return []interface{}{}, nil
-		}
-	}
-	return m.BaseNcObject.GetProperty(id)
+	return m.ClassManager.GetProperty(nca.PropertyID(id))
+}
+
+func (m *NcClassManager) SetProperty(id NCPPropertyID, value interface{}) error {
+	return m.ClassManager.SetProperty(nca.PropertyID(id), value)
 }
 
 func (m *NcClassManager) InvokeMethod(id NCPMethodID, args json.RawMessage) (interface{}, error) {
-	// Method 3,1: GetControlClass
-	if id.Level == 3 && id.Index == 1 {
-		var callArgs struct {
-			ClassID []int `json:"classId"`
-		}
-		if err := json.Unmarshal(args, &callArgs); err != nil {
-			return map[string]interface{}{"status": 400}, nil
-		}
-
-		classKey := ""
-		for i, part := range callArgs.ClassID {
-			if i > 0 {
-				classKey += "."
-			}
-			classKey += fmt.Sprint(part)
-		}
-
-		if class, ok := m.Classes[classKey]; ok {
-			return map[string]interface{}{"status": 200, "value": class}, nil
-		}
-
-		return map[string]interface{}{"status": 404}, nil
-	}
-	return m.BaseNcObject.InvokeMethod(id, args)
+	return m.ClassManager.InvokeMethod(nca.MethodID(id), args)
 }
 
-// NcWorker represents an NMOS Control Worker (e.g., for a parameter)
+// NcWorker wraps nca.Worker to implement the NcObject interface
 type NcWorker struct {
-	BaseNcObject
-	Value interface{}
-	// Callback to sync back to the actual device
-	OnSet func(val interface{}) error
+	*nca.Worker
 }
 
 func NewNcWorker(oid int, classID []int, owner *int, role, label string) *NcWorker {
 	return &NcWorker{
-		BaseNcObject: BaseNcObject{
-			OID:         oid,
-			ClassID:     classID,
-			ConstantOID: true,
-			Owner:       owner,
-			Role:        role,
-			UserLabel:   label,
-		},
+		Worker: nca.NewWorker(oid, classID, owner, role, label),
 	}
+}
+
+func (w *NcWorker) GetOID() int {
+	return w.Worker.GetOID()
+}
+
+func (w *NcWorker) GetClassID() []int {
+	return w.Worker.GetClassID()
+}
+
+func (w *NcWorker) GetRole() string {
+	return w.Worker.GetRole()
+}
+
+func (w *NcWorker) GetDescriptor() NcBlockMemberDescriptor {
+	return blockMemberDescriptorToNcBlockMemberDescriptor(w.Worker.GetDescriptor())
+}
+
+func (w *NcWorker) SetNotifyCallback(cb func(oid int, eventID NCPEventID, eventData PropertyChangedEventData)) {
+	w.Worker.SetNotifyCallback(func(oid int, eventID nca.EventID, eventData nca.PropertyChangedData) {
+		cb(oid, NCPEventID(eventID), PropertyChangedEventData(eventData))
+	})
 }
 
 func (w *NcWorker) GetProperty(id NCPPropertyID) (interface{}, error) {
-	// Level 2, Index 1 is often the primary value in many worker classes
-	if id.Level == 2 && id.Index == 1 {
-		return w.Value, nil
-	}
-	return w.BaseNcObject.GetProperty(id)
+	return w.Worker.GetProperty(nca.PropertyID(id))
 }
 
 func (w *NcWorker) SetProperty(id NCPPropertyID, value interface{}) error {
-	if id.Level == 2 && id.Index == 1 {
-		if w.OnSet != nil {
-			if err := w.OnSet(value); err != nil {
-				return err
-			}
-		}
-		w.Value = value
-		if w.Notify != nil {
-			w.Notify(w.OID, NCPEventID{1, 1}, PropertyChangedEventData{
-				PropertyID: id,
-				ChangeType: 0,
-				Value:      value,
-			})
-		}
-		return nil
-	}
-	return w.BaseNcObject.SetProperty(id, value)
+	return w.Worker.SetProperty(nca.PropertyID(id), value)
 }
 
-// Helper to convert slices to string keys
+func (w *NcWorker) InvokeMethod(id NCPMethodID, args json.RawMessage) (interface{}, error) {
+	return w.Worker.InvokeMethod(nca.MethodID(id), args)
+}
+
+// SetValue sets the worker's value and triggers notification
+func (w *NcWorker) SetValue(value interface{}) {
+	w.Worker.SetValue(value)
+}
+
+// IsEnabled returns the worker's enabled status
+func (w *NcWorker) IsEnabled() bool {
+	return w.Worker.IsEnabled()
+}
+
+// ncpObjectAdapter wraps an NcObject to also implement nca.Object
+// This allows using nca.Block.SetResolver with NcObject types
+type ncpObjectAdapter struct {
+	NcObject
+}
+
+func (a *ncpObjectAdapter) GetRole() string {
+	return a.NcObject.GetRole()
+}
+
+func (a *ncpObjectAdapter) GetDescriptor() nca.BlockMemberDescriptor {
+	d := a.NcObject.GetDescriptor()
+	return nca.BlockMemberDescriptor{
+		Role:        d.Role,
+		OID:         d.OID,
+		ConstantOID: d.ConstantOID,
+		ClassID:     d.ClassID,
+		UserLabel:   d.UserLabel,
+		Owner:       d.Owner,
+		Description: d.Description,
+	}
+}
+
+// BaseNcObject provides backward compatibility - now just aliases nca.BaseObject
+// Deprecated: Use nca.BaseObject directly or wrap with NcBlock/NcWorker/NcClassManager
+type BaseNcObject = nca.BaseObject
+
+// Helper to convert classID slice to string key
 func classIDToKey(classID []int) string {
 	res := ""
 	for i, v := range classID {
@@ -335,32 +352,54 @@ func classIDToKey(classID []int) string {
 	return res
 }
 
-func (m *NcClassManager) GetControlClass(classID []int) (NcClassDescriptor, bool) {
-	key := classIDToKey(classID)
-	c, ok := m.Classes[key]
-	return c, ok
+// NCPObjectToNcObjectAdapter wraps an nca.Object to implement NcObject
+type NCPObjectToNcObjectAdapter struct {
+	obj nca.Object
 }
 
-// Equal check for NCPPropertyID
-func (id NCPPropertyID) Equal(other NCPPropertyID) bool {
-	return id.Level == other.Level && id.Index == other.Index
+func NewNCPObjectToNcObjectAdapter(obj nca.Object) *NCPObjectToNcObjectAdapter {
+	return &NCPObjectToNcObjectAdapter{obj: obj}
 }
 
-func compareClassIDs(a, b []int) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+func (a *NCPObjectToNcObjectAdapter) GetOID() int {
+	return a.obj.GetOID()
 }
 
-func (m *NcClassManager) IsDerivedFrom(classID, parentID []int) bool {
-	if len(classID) < len(parentID) {
-		return false
+func (a *NCPObjectToNcObjectAdapter) GetClassID() []int {
+	return a.obj.GetClassID()
+}
+
+func (a *NCPObjectToNcObjectAdapter) GetRole() string {
+	return a.obj.GetRole()
+}
+
+func (a *NCPObjectToNcObjectAdapter) GetProperty(id NCPPropertyID) (interface{}, error) {
+	return a.obj.GetProperty(nca.PropertyID(id))
+}
+
+func (a *NCPObjectToNcObjectAdapter) SetProperty(id NCPPropertyID, value interface{}) error {
+	return a.obj.SetProperty(nca.PropertyID(id), value)
+}
+
+func (a *NCPObjectToNcObjectAdapter) InvokeMethod(id NCPMethodID, args json.RawMessage) (interface{}, error) {
+	return a.obj.InvokeMethod(nca.MethodID(id), args)
+}
+
+func (a *NCPObjectToNcObjectAdapter) GetDescriptor() NcBlockMemberDescriptor {
+	d := a.obj.GetDescriptor()
+	return NcBlockMemberDescriptor{
+		Role:        d.Role,
+		OID:         d.OID,
+		ConstantOID: d.ConstantOID,
+		ClassID:     d.ClassID,
+		UserLabel:   d.UserLabel,
+		Owner:       d.Owner,
+		Description: d.Description,
 	}
-	return reflect.DeepEqual(classID[:len(parentID)], parentID)
+}
+
+func (a *NCPObjectToNcObjectAdapter) SetNotifyCallback(cb func(oid int, eventID NCPEventID, eventData PropertyChangedEventData)) {
+	a.obj.SetNotifyCallback(func(oid int, eventID nca.EventID, eventData nca.PropertyChangedData) {
+		cb(oid, NCPEventID(eventID), PropertyChangedEventData(eventData))
+	})
 }
