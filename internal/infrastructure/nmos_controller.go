@@ -885,8 +885,8 @@ func (c *nmosController) Stop(ctx context.Context) error {
 	// Signal all goroutines to stop FIRST
 	close(c.done)
 
-	// Perform controlled unregistration (may fail silently if context expires)
-	unregCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	// Perform controlled unregistration using a fresh context (not the canceled shutdown context)
+	unregCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	c.unregisterAll(unregCtx)
 	cancel()
 
