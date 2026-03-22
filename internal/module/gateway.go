@@ -126,17 +126,29 @@ func (g *gatewayImpl) handleDiscovery(ctx context.Context, devices <-chan infras
 
 // addShureController creates and starts a new Shure controller for an address
 func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev infrastructure.DiscoveredDevice) {
+	// Check if already exists (quick lock release)
 	g.mu.Lock()
-	defer g.mu.Unlock()
-
 	if info, ok := g.shureCtrls[addr]; ok {
 		info.lastSeen = time.Now() // Refresh heartbeat
+		g.mu.Unlock()
 		return
 	}
+	g.mu.Unlock()
 
+	// Start TCP connection WITHOUT holding lock
 	ctrl := infrastructure.NewShureController(addr)
 	if err := ctrl.Start(ctx); err != nil {
 		slog.Error("Failed to start Shure controller", "address", addr, "error", err)
+		return
+	}
+
+	// Now add to map with lock held
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Double-check after acquiring lock
+	if info, ok := g.shureCtrls[addr]; ok {
+		info.lastSeen = time.Now()
 		return
 	}
 
