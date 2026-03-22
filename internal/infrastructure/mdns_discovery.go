@@ -86,7 +86,7 @@ func (d *ShureDiscoverer) browseMDNS(service string) {
 		return
 	}
 
-	entries := make(chan *zeroconf.ServiceEntry)
+	entries := make(chan *zeroconf.ServiceEntry, 10)
 	go func(results <-chan *zeroconf.ServiceEntry) {
 		for entry := range results {
 			var addr net.IP
@@ -122,18 +122,19 @@ func (d *ShureDiscoverer) browseMDNS(service string) {
 func (d *ShureDiscoverer) listenShureDiscovery() {
 	multicastAddr := "239.255.254.253:8427"
 	addr, _ := net.ResolveUDPAddr("udp4", multicastAddr)
-	
+
+	var conn *net.UDPConn
+	var err error
+
 	// Join multicast group
-	conn, err := net.ListenMulticastUDP("udp4", nil, addr)
+	conn, err = net.ListenMulticastUDP("udp4", nil, addr)
 	if err != nil {
-		// Fallback to standard UDP listen if multicast fails
 		conn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 8427})
 		if err != nil {
 			slog.Error("Shure Discovery: Failed to bind", "error", err)
 			return
 		}
 	}
-	defer conn.Close()
 
 	slog.Info("Shure Discovery: Proprietary protocol listener active", "addr", multicastAddr)
 
@@ -143,7 +144,7 @@ func (d *ShureDiscoverer) listenShureDiscovery() {
 		case <-d.ctx.Done():
 			return
 		default:
-			conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+			conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 			n, _, err := conn.ReadFromUDP(buffer)
 			if err != nil {
 				continue
@@ -156,7 +157,7 @@ func (d *ShureDiscoverer) listenShureDiscovery() {
 
 			model := d.extractValue(payload, "acn-fctn")
 			ip := d.extractIPFromPayload(payload)
-			
+
 			if ip != "" {
 				d.sendDevice(DiscoveredDevice{
 					Instance: model,
@@ -173,7 +174,7 @@ func (d *ShureDiscoverer) listenShureDiscovery() {
 // sendDevice sends a discovered device to the channel if it's new or needs a heartbeat update
 func (d *ShureDiscoverer) sendDevice(dev DiscoveredDevice) {
 	key := dev.Address.String()
-	
+
 	d.mu.Lock()
 	if last, ok := d.lastSent[key]; ok && time.Since(last) < 30*time.Second {
 		d.mu.Unlock()
@@ -216,7 +217,7 @@ func (d *ShureDiscoverer) extractIPFromPayload(payload string) string {
 		return ""
 	}
 	start += len(marker)
-	
+
 	end := -1
 	delimiters := []string{":", "/", ",", ")"}
 	for _, del := range delimiters {
@@ -225,7 +226,7 @@ func (d *ShureDiscoverer) extractIPFromPayload(payload string) string {
 			end = pos
 		}
 	}
-	
+
 	if end == -1 {
 		return payload[start:]
 	}

@@ -61,15 +61,21 @@ func (c *shureController) Start(ctx context.Context) error {
 		c.readEvents(ctx)
 	}()
 
-	// Start goroutine to handle connection lifecycle
+	// Start goroutine to handle connection lifecycle - signals when context is done
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
 		<-ctx.Done()
-		c.Stop(context.Background())
+		c.signalDone()
 	}()
 
 	return nil
+}
+
+// signalDone signals the Shure controller to stop (used by lifecycle goroutine)
+func (c *shureController) signalDone() {
+	c.isRunning = false
+	close(c.done)
 }
 
 // Stop halts the Shure controller
@@ -78,11 +84,11 @@ func (c *shureController) Stop(ctx context.Context) error {
 		return nil
 	}
 
-	c.isRunning = false
-	close(c.done)
+	c.signalDone()
 
-	// Close connection
+	// Force unblock any read operations with a deadline
 	if c.conn != nil {
+		c.conn.SetReadDeadline(time.Now().Add(-1 * time.Second))
 		c.conn.Close()
 	}
 
