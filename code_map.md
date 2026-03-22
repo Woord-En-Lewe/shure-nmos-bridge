@@ -24,30 +24,112 @@
 - **public_functions**: 
   - NewGateway(shureAddr, nmosAddr string) Gateway - Factory function to create a new Gateway instance
 
+## Module: internal/nca
+- **summary**: Generic NMOS Control Architecture (NCA) model implementing MS-05-01/MS-05-02. Provides Object interface, Block container (with FindMembersByPath/Role/ClassID), Worker for device parameters, Manager base class, DeviceManager for device info, and ClassManager for class discovery. Implements proper NcMethodStatus codes, VersionCode, Manufacturer, Product types. Used to create device models that expose NCA-compliant control APIs.
+- **when_to_use**: When building NMOS devices or controllers that implement NCA control model
+- **public_types**: 
+  - EventID, PropertyID, MethodID - NCA element identifiers (level, index)
+  - NcMethodStatus - Status codes per MS-05-02 (StatusOk, StatusBadOid, StatusReadonly, etc.)
+  - PropertyChangedData - Event payload for property changes
+  - PropertyConstraints - Runtime property constraints
+  - BlockMemberDescriptor - Metadata for objects in a block
+  - ClassDescriptor, PropertyDescriptor, MethodDescriptor, EventDescriptor, ParameterDescriptor - Class metadata types
+  - VersionCode, Manufacturer, Product - Device metadata types
+  - Touchpoint, TouchpointNmos, TouchpointResourceNmos - NMOS IS-04/IS-05/IS-07 touchpoint linkage
+  - Object - Interface for all NCA control objects (GetOID, GetClassID, GetRole, GetProperty, SetProperty, InvokeMethod, GetDescriptor, SetNotifyCallback)
+  - BaseObject - Default implementation with touchpoints, runtime constraints, and sequence support
+  - Block - Container for control objects with GetMemberDescriptors, FindMembersByPath, FindMembersByRole, FindMembersByClassID methods
+  - Worker - Base for control/monitoring features (NcWorker)
+  - Manager - Base for device managers (NcManager)
+  - DeviceManager - Device information and status manager (1.3.1)
+  - ClassManager - Class and datatype discovery manager (1.3.2)
+- **public_functions**: 
+  - NewBlock(oid int, owner *int, role, label string) *Block - Create a block container (classID 1.1)
+  - NewWorker(oid int, classID []int, owner *int, role, label string) *Worker - Create a worker
+  - NewManager(oid int, classID []int, owner *int, role, label string) *Manager - Create a manager base
+  - NewDeviceManager(oid int, owner *int) *DeviceManager - Create device manager (OID 2, fixed role "DeviceManager")
+  - NewClassManager(oid int, owner *int) *ClassManager - Create class manager (OID 3, fixed role "ClassManager")
+  - PtrInt(i int) *int - Helper for optional int values
+  - ptrString(s string) *string - Helper for optional string values
+
 ## Module: internal/infrastructure
-- **summary**: Contains infrastructure implementations for Shure Axient control protocol, NMOS IS-04/IS-05, and message passing. This layer handles all external system interactions. The Shure controller implements actual TCP/IP communication with Shure Axient devices using the TPCI command protocol. Includes builder pattern for commands, domain-specific types for parsing responses, and robust mDNS discovery using the zeroconf library for automatic device detection. The NMOS controller now includes automatic registry discovery via mDNS and node self-registration per IS-04 specification.
+- **summary**: Contains infrastructure implementations for Shure Axient control protocol, NMOS IS-04/IS-05/IS-07/IS-12, and message passing. This layer handles all external system interactions. The Shure controller implements actual TCP/IP communication with Shure Axient devices using the TPCI command protocol. Includes builder pattern for commands, domain-specific types for parsing responses, and robust mDNS discovery using the zeroconf library for automatic device detection. The NMOS controller now includes automatic registry discovery via mDNS and node self-registration per IS-04 specification, IS-07 websocket events, IS-12 NCP control protocol with subscription support and sequence methods (1m3-1m7). Supports all Shure networked wireless families: Axient Digital, ULX-D, QLX-D, SLX-D, and SLX-D+. The NCP types (NCPPropertyID, NCPMethodID, NCPEventID) are now type aliases to the MS-05 defined types in the nca package, and the NcObject, NcBlock, NcWorker, NcClassManager types are wrappers around the nca library implementations.
 - **when_to_use**: Use this module when you need to understand or modify how the gateway interacts with external systems (Shure devices, NMOS registry/event systems)
 - **public_types**: 
   - ShureController - Interface for Shure Axient communication
-  - NMOSController - Interface for NMOS IS-04/IS-05 communication (added UpdateResource, BroadcastEvent methods, IS-07 websocket support for real-time events, automatic registry discovery, node self-registration, IS-04 heartbeat loop with automatic re-registration, and IS-05 Connection Management PATCH support for staged parameters)
+  - NMOSController - Interface for NMOS IS-04/IS-05/IS-07/IS-12 communication (includes UpdateResource, BroadcastEvent, SetControls, OnControlChange, GetControls, GetNodeID, SubscribeToEvents methods; automatic registry discovery; node self-registration; IS-04 heartbeat loop with re-registration; IS-05 Connection Management; IS-07 websocket events; IS-12 NCP with subscription and sequence support)
   - ConnectionStaged - IS-05 data structure for staged transport parameters
   - ConnectionActive - IS-05 data structure for active transport parameters
   - ConnectionActivation - IS-05 data structure for connection activation settings
+  - NCPMessage - IS-12 message structure with support for commands, commandResponses, notifications, subscriptions, subscriptionResults, and errors
+  - NCPCommand - IS-12 command structure (handle, oid, methodId, arguments)
+  - NCPCommandResponse - IS-12 command response structure (replaces old NCPResponse)
+  - NCPNotification - IS-12 notification structure for PropertyChanged events
+  - NCPSubscription - IS-12 subscription request structure
+  - NCPSubscriptionResult - IS-12 subscription response structure
+  - NCPError - IS-12 error message structure
+  - NCPMethodID - Type alias to nca.MethodID (MS-05-01 compliant method identifier)
+  - NCPPropertyID - Type alias to nca.PropertyID (MS-05-01 compliant property identifier)
+  - NCPEventID - Type alias to nca.EventID (MS-05-01 compliant event identifier)
+  - PropertyChangedEventData - Type alias to nca.PropertyChangedData (MS-05-01 event payload)
+  - NcObject - Interface for NMOS control objects with GetProperty, SetProperty, InvokeMethod support (wraps nca.Object)
+  - BaseNcObject - Type alias to nca.BaseObject (for backward compatibility)
+  - NcBlock - Wrapper around nca.Block implementing NcObject interface
+  - NcClassManager - Wrapper around nca.ClassManager implementing NcObject interface
+  - NcWorker - Wrapper around nca.Worker implementing NcObject interface
   - MessageBus - Interface for internal message passing (defined in message_bus.go)
   - Message - Structure for messages passed between components (added Source field for origin tracking)
   - MessageType - Type definition for message categorization (defined in message_bus.go)
   - ShureCommandBuilder - Builder pattern for creating Shure commands
-  - Gain, Mute, Frequency, Channel, DeviceID - Domain-specific types for Shure parameters
+  - ShureCommandBuilderWithModel - Model-aware command builder that handles parameter naming per family (underscores vs spaces)
+  - ShureModelFamily - Enum for Shure model families (AxientDigital, ULXD, QLXD, SLXD, SLXDPlus)
+  - Gain, Mute, Frequency, Channel, DeviceID, AxientGain, AxientLevel, ULXDGain, SLDXAudioLevel, ULXDRFLevel - Domain-specific types for Shure parameters
   - DeviceStatus - Domain type for parsed Shure device status
   - TPCIReport - Parsed Shure response including Type (REP/SAMPLE), Channel, Param, and Value
+  - SampleReport - Parsed Axient Digital SAMPLE response with full metering data
+  - ULXDSampleReport - Parsed ULX-D/QLX-D SAMPLE response
+  - SLDXSampleReport - Parsed SLX-D/SLX-D+ SAMPLE response
+  - RepReport - Parsed REP response with full device/channel properties
   - ShureDiscoverer - Robust mDNS-based discovery for Shure Axient devices using zeroconf
   - DiscoveredDevice - Representation of a discovered Shure device
+  - AxientGain, ULXDGain, SLDXAudioLevel, ULXDRFLevel - Audio/RF level types with dB/dBFS/dBm conversion methods
+  - EncryptionMode, EncryptionStatus, InterferenceStatus, SlotStatus, SlotProperty - Enums for Shure device states
+  - QuadversityMode, FDMode - Axient-specific RF mode enums
+  - HighDensityMode, AudioSummingMode, FrequencyDiversityMode - ULX-D specific mode enums
+  - AudioOutputLevelSwitch, RemotePairStatus, RemotePairAction, LinkTXStatus - SLX-D/SLX-D+ specific enums
+  - AntennaSquelchStatus, TXMuteStatus, TXMuteButtonStatus, TXPowerSource, BatteryType, TXLock - Telemetry enums
+  - NetworkInterface, IPMode - SLX-D+ Dante network enums
 - **public_functions**: 
   - NewShureController(addr string) ShureController - Factory for Shure controller (now implements real TCP/IP communication)
-  - NewNMOSController(addr string) NMOSController - Factory for NMOS controller (now automatically discovers registries and registers the node)
+  - NewNMOSController(addr string) NMOSController - Factory for NMOS controller (auto-discovers registries, registers node, supports IS-07/IS-12)
   - NewInMemoryMessageBus() MessageBus - Factory for in-memory message bus
   - NewShureCommand(command string) *ShureCommandBuilder - Factory for command builder
+  - NewShureCommandWithModel(command string, family ShureModelFamily) *ShureCommandBuilderWithModel - Factory for model-aware command builder
   - ParseTPCIResponse(response string) *TPCIReport - Parse TPCI strings into structured reports
   - IsMeteredParam(param string) bool - Identifies if a parameter is a metered property (IS-07)
   - ParseDeviceStatus(response string) (*DeviceStatus, error) - Parse Shure responses into domain types
+  - ParseSampleReport(response string) *SampleReport - Parse Axient Digital SAMPLE metering response
+  - ParseULXDSampleReport(response string) *ULXDSampleReport - Parse ULX-D/QLX-D SAMPLE response
+  - ParseSLDXSampleReport(response string) *SLDXSampleReport - Parse SLX-D/SLX-D+ SAMPLE response
+  - ParseRepReport(response string) *RepReport - Parse REP response into structured data
+  - DetectModelFamily(model string) ShureModelFamily - Detect Shure model family from MODEL string
+  - DetectSampleFormat(response string) string - Detect SAMPLE format type (axient, ulxd, sldx)
   - NewShureDiscoverer() *ShureDiscoverer - Factory for mDNS discovery of Shure devices
+  - GetModelCommand, GetFWVersionCommand, GetGroupChannelCommand, SetGroupChannelCommand - Universal device commands
+  - GetEncryptionModeCommand, SetEncryptionModeCommand, GetMeterRateCommand, SetMeterRateCommand - Universal settings
+  - GetSlotPropertyCommand, SetSlotPropertyCommand - Axient transmitter slot commands
+  - GetQuadversityModeCommand, SetQuadversityModeCommand, GetFDModeCommand, SetFDModeCommand, GetInterferenceStatusCommand - Axient RF modes
+  - GetTXBatteryBarsCommand, GetTXBatteryChargePercentCommand, GetTXBatteryMinsCommand, GetTXBatteryTempCCommand - Battery telemetry
+  - GetTXBatteryCycleCountCommand, GetTXBatteryHealthCommand, GetTXBatteryTypeCommand, GetTXMuteStatusCommand, GetTXMuteButtonStatusCommand, GetTXPowerSourceCommand - More telemetry
+  - GetTXPowerLevelCommand, GetTXOffsetCommand, GetTXLockCommand - Transmitter commands
+  - GetHighDensityModeCommand, SetHighDensityModeCommand, GetAudioSummingModeCommand, SetAudioSummingModeCommand - ULX-D modes
+  - GetFrequencyDiversityModeCommand, SetFrequencyDiversityModeCommand, GetEncryptionWarningCommand - ULX-D specific
+  - GetAudioOutputLevelSwitchCommand, SetAudioOutputLevelSwitchCommand - SLX-D audio output
+  - GetNADeviceNameCommand, GetNAChannelNameCommand, SetNetSettingsCommand - SLX-D+ Dante network
+  - GetAppConnEnabledCommand, SetRemotePairCommand, RespondRemotePairCommand - SLX-D+ Bluetooth
+  - GetLinkStatusCommand, GetLinkTXModelCommand, GetLinkTXBatteryMinsCommand, RebootLinkTXCommand - SLX-D+ transmitter link
+  - GetEncryptionStatusCommand, GetSLXInterferenceStatusCommand - SLX-D/SLX-D+ status
+  - GetTXAvailableCommand, GetBattTimeToFullCommand, GetBattBarsCommand, GetBattChargeCommand - Networked charger
+  - NewNcBlock(oid int, owner *int, role, label string) *NcBlock - Create NcBlock (wraps nca.Block)
+  - NewNcWorker(oid int, classID []int, owner *int, role, label string) *NcWorker - Create NcWorker (wraps nca.Worker)
+  - NewNcClassManager(oid int, owner *int) *NcClassManager - Create NcClassManager (wraps nca.ClassManager)
