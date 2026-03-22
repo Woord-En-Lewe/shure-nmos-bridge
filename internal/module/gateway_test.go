@@ -114,7 +114,7 @@ func TestHandleShureDevice(t *testing.T) {
 		}
 	})
 
-	t.Run("Metered parameter in REP routing - no IS-07 broadcast", func(t *testing.T) {
+	t.Run("Metered parameter in REP routing - creates IS-07 sender and broadcasts", func(t *testing.T) {
 		mockNMOS.broadcastEvents = nil
 		report := &infrastructure.TPCIReport{
 			Type:    "REP",
@@ -128,11 +128,9 @@ func TestHandleShureDevice(t *testing.T) {
 			Payload: report,
 		})
 
-		// REP responses to GET commands should NOT trigger IS-07 broadcasts
-		// IS-07 is for spontaneous events from the device (SAMPLE messages)
-		// REP is just answering our query - not an event
-		if len(mockNMOS.broadcastEvents) != 0 {
-			t.Errorf("Expected 0 broadcast events (REP is response to GET, not IS-07 event), got %d", len(mockNMOS.broadcastEvents))
+		// REP metered parameters should create IS-07 sender and broadcast current value
+		if len(mockNMOS.broadcastEvents) != 1 {
+			t.Errorf("Expected 1 broadcast event, got %d", len(mockNMOS.broadcastEvents))
 		}
 	})
 

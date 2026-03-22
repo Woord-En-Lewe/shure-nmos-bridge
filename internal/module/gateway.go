@@ -587,13 +587,14 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 			}
 		}
 	} else if infrastructure.IsMeteredParam(report.Param) {
-		// REP responses to GET commands should not be broadcast as IS-07 events
-		// However, metered parameters should still have their IS-07 sender registered
-		// (lazy registration) so they're ready for when the device sends spontaneous data
+		// REP responses establish current state - broadcast as IS-07 event
+		// This allows consumers to subscribe and receive current values
 		deviceID := info.nmosDeviceIDs[0]
 		deviceInstance := info.deviceInstance
 		g.ensureIS07Resources(info, report.Channel, report.Param, deviceID, deviceInstance)
-		// Note: We don't broadcast REP responses - they're answers to our GET, not events
+		if sID, ok := info.sourceIDs[report.Channel][report.Param]; ok {
+			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel][report.Param], getNMOSEventType(report.Param), report.Value)
+		}
 	}
 
 	// IS-12 NCP Parameter Updates
