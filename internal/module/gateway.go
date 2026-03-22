@@ -105,7 +105,14 @@ func (g *gatewayImpl) handleDiscovery(ctx context.Context, devices <-chan infras
 		select {
 		case <-ctx.Done():
 			return
-		case dev := <-devices:
+		case <-time.After(100 * time.Millisecond):
+			// Periodically check ctx without blocking on devices channel
+			continue
+		case dev, ok := <-devices:
+			if !ok {
+				// Channel closed
+				return
+			}
 			// Filter out Wireless Workbench (WWB) instances
 			if strings.Contains(strings.ToUpper(dev.Instance), "WWB") {
 				continue
