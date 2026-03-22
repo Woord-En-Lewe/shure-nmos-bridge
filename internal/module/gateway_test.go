@@ -34,6 +34,9 @@ func (m *mockNMOSController) RegisterNCPObject(oid int, obj infrastructure.NcObj
 	}
 	m.ncpObjects[oid] = obj
 }
+func (m *mockNMOSController) RegisterResource(resourceType string, resource interface{}) error {
+	return nil
+}
 func (m *mockNMOSController) GetNCPObject(oid int) infrastructure.NcObject {
 	return m.ncpObjects[oid]
 }
@@ -41,17 +44,17 @@ func (m *mockNMOSController) UpdateResource(resourceType string, id string, upda
 	// Minimal implementation for test
 	return nil
 }
-func (m *mockNMOSController) GetControls(deviceID string) []map[string]interface{} { return nil }
+func (m *mockNMOSController) GetControls(deviceID string) []map[string]interface{}           { return nil }
 func (m *mockNMOSController) SetControls(deviceID string, controls []map[string]interface{}) {}
 
 type mockShureController struct {
 	infrastructure.ShureController
 }
 
-func (m *mockShureController) Start(ctx context.Context) error { return nil }
-func (m *mockShureController) Stop(ctx context.Context) error  { return nil }
+func (m *mockShureController) Start(ctx context.Context) error       { return nil }
+func (m *mockShureController) Stop(ctx context.Context) error        { return nil }
 func (m *mockShureController) SendCommand(command interface{}) error { return nil }
-func (m *mockShureController) ReceiveEvents() <-chan interface{} { return nil }
+func (m *mockShureController) ReceiveEvents() <-chan interface{}     { return nil }
 
 func TestHandleShureDevice(t *testing.T) {
 	mockNMOS := &mockNMOSController{}
@@ -106,12 +109,12 @@ func TestHandleShureDevice(t *testing.T) {
 			Payload: report,
 		})
 
-		if len(mockNMOS.broadcastEvents) != 9 {
-			t.Errorf("Expected 9 broadcast events, got %d", len(mockNMOS.broadcastEvents))
+		if len(mockNMOS.broadcastEvents) != 13 {
+			t.Errorf("Expected 13 broadcast events (9 pre-registered + 4 lazy registered), got %d", len(mockNMOS.broadcastEvents))
 		}
 	})
 
-	t.Run("Metered parameter in REP routing", func(t *testing.T) {
+	t.Run("Metered parameter in REP routing - no IS-07 broadcast", func(t *testing.T) {
 		mockNMOS.broadcastEvents = nil
 		report := &infrastructure.TPCIReport{
 			Type:    "REP",
@@ -125,11 +128,11 @@ func TestHandleShureDevice(t *testing.T) {
 			Payload: report,
 		})
 
-		if len(mockNMOS.broadcastEvents) != 1 {
-			t.Errorf("Expected 1 broadcast event, got %d", len(mockNMOS.broadcastEvents))
-		}
-		if mockNMOS.broadcastEvents[0].eventType != "number" {
-			t.Errorf("Expected event type 'number', got '%s'", mockNMOS.broadcastEvents[0].eventType)
+		// REP responses to GET commands should NOT trigger IS-07 broadcasts
+		// IS-07 is for spontaneous events from the device (SAMPLE messages)
+		// REP is just answering our query - not an event
+		if len(mockNMOS.broadcastEvents) != 0 {
+			t.Errorf("Expected 0 broadcast events (REP is response to GET, not IS-07 event), got %d", len(mockNMOS.broadcastEvents))
 		}
 	})
 
@@ -157,7 +160,7 @@ func TestHandleShureDevice(t *testing.T) {
 		if len(mockNMOS.ncpObjects) != 1 {
 			t.Errorf("Expected 1 NCP object, got %d", len(mockNMOS.ncpObjects))
 		}
-		
+
 		// Get the object and check its value
 		var worker *infrastructure.NcWorker
 		for _, obj := range mockNMOS.ncpObjects {
@@ -166,7 +169,7 @@ func TestHandleShureDevice(t *testing.T) {
 				break
 			}
 		}
-		
+
 		if worker == nil {
 			t.Fatal("NCP object is not an NcWorker")
 		}

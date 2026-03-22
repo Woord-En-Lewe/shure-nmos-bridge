@@ -28,10 +28,10 @@ func TestControlledUnregistration(t *testing.T) {
 			// Path format: /x-nmos/registration/v1.3/resource/{type}/{id}
 			path := strings.Trim(r.URL.Path, "/")
 			segments := strings.Split(path, "/")
-			
+
 			resourceType := ""
 			id := ""
-			
+
 			if len(segments) >= 6 {
 				resourceType = segments[4]
 				id = segments[5]
@@ -53,6 +53,7 @@ func TestControlledUnregistration(t *testing.T) {
 	ctrl.registryURL = ts.URL
 	ctrl.httpClient = ts.Client()
 	ctrl.isRunning = true
+	ctrl.registered = true // Mark as registered so unregistration proceeds
 
 	// Pre-populate resources
 	ctrl.resources["devices"] = append(ctrl.resources["devices"], map[string]interface{}{"id": "device-1"})
@@ -71,12 +72,12 @@ func TestControlledUnregistration(t *testing.T) {
 	// Verify deletions happened in the correct order
 	// Receivers -> Senders -> Flows -> Sources -> Devices -> Node
 	expectedOrder := []string{"receivers", "senders", "flows", "sources", "devices", "node"}
-	
+
 	mu.Lock()
 	defer mu.Unlock()
-	
+
 	assert.Equal(t, len(expectedOrder), len(deletions), "Should have deleted all resources plus the node")
-	
+
 	for i, expectedType := range expectedOrder {
 		if i < len(deletions) {
 			assert.Equal(t, expectedType, deletions[i].resourceType, "Wrong deletion order at index %d", i)
