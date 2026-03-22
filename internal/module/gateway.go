@@ -172,7 +172,26 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 
 		// Wait for model detection before querying channel params
 		// The model family will be set when we receive REP(MODEL)
-		time.Sleep(200 * time.Millisecond)
+		// Retry MODEL query if no response after 500ms
+		waited := 0
+		for {
+			time.Sleep(250 * time.Millisecond)
+			waited += 250
+			family := infrastructure.ModelFamilyAxientDigital
+			g.mu.RLock()
+			if info, ok := g.shureCtrls[addr]; ok && info.modelFamily != "" {
+				family = info.modelFamily
+			}
+			g.mu.RUnlock()
+			if family != infrastructure.ModelFamilyAxientDigital || waited >= 1000 {
+				break
+			}
+			// Retry MODEL query
+			ctrl.SendCommand(infrastructure.NewShureCommand("GET").
+				WithIndex(0).
+				WithParam("MODEL", nil).
+				Build())
+		}
 
 		// 2. Query channel-specific parameters for channels 1-4
 		// Get current model family (may still be default, FormatParamName handles this)
