@@ -598,7 +598,7 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 	}
 
 	// IS-12 NCP Parameter Updates
-	// REP messages should go to NCP
+	// REP messages should go to NCP (including metered params for control)
 	if report.Type == "REP" && report.Param != "ALL" {
 		paramKey := fmt.Sprintf("%d_%s", report.Channel, report.Param)
 		g.mu.Lock()
