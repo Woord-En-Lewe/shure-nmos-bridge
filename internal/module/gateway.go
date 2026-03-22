@@ -305,7 +305,11 @@ func (g *gatewayImpl) listenToShureEvents(ctx context.Context, addr string, even
 		select {
 		case <-ctx.Done():
 			return
-		case ev := <-events:
+		case ev, ok := <-events:
+			if !ok {
+				// Channel closed, exit
+				return
+			}
 			if report, ok := ev.(*infrastructure.TPCIReport); ok {
 				// Log ALL responses for discovery debugging
 				if strings.Contains(report.Raw, "REP") {

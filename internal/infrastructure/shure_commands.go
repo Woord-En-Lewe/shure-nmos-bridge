@@ -338,8 +338,11 @@ type TPCIReport struct {
 }
 
 // IsMeteredParam returns true if the parameter is a metered property
+// Handles both underscore (Axient/SLX-D) and space (QLX-D/ULX-D) naming conventions
 func IsMeteredParam(param string) bool {
-	switch param {
+	// Normalize spaces to underscores for QLX-D/ULX-D compatibility
+	normalized := strings.ReplaceAll(param, " ", "_")
+	switch normalized {
 	case "CHAN_QUALITY", "AUDIO_LED_BITMAP", "AUDIO_LEVEL_PEAK", "AUDIO_LEVEL_RMS",
 		"ANTENNA_STATUS", "RF_LED_BITMAP_A", "RF_RSSI_A", "RF_LED_BITMAP_B", "RF_RSSI_B",
 		"RF_LED_BITMAP_C", "RF_RSSI_C", "RF_LED_BITMAP_D", "RF_RSSI_D",
