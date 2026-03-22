@@ -156,34 +156,74 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		time.Sleep(500 * time.Millisecond)
 		slog.Info("Requesting full device discovery", "address", addr)
 
-		// 1. Get device-level parameters (channel 0 with ALL)
-		ctrl.SendCommand(infrastructure.GetAllCommand(0))
+		// 1. Get device-level parameters first (MODEL, DEVICE_ID, FW_VER) to detect family
+		ctrl.SendCommand(infrastructure.NewShureCommand("GET").
+			WithIndex(0).
+			WithParam("MODEL", nil).
+			Build())
+		ctrl.SendCommand(infrastructure.NewShureCommand("GET").
+			WithIndex(0).
+			WithParam("DEVICE_ID", nil).
+			Build())
+		ctrl.SendCommand(infrastructure.NewShureCommand("GET").
+			WithIndex(0).
+			WithParam("FW_VER", nil).
+			Build())
 
-		time.Sleep(100 * time.Millisecond)
+		// Wait for model detection before querying channel params
+		// The model family will be set when we receive REP(MODEL)
+		time.Sleep(200 * time.Millisecond)
 
-		// 2. Query channel-specific parameters for channels 1-4 (channel 0 is device level, not audio)
-		channelParams := []string{
+		// 2. Query channel-specific parameters for channels 1-4
+		// Get current model family (may still be default, FormatParamName handles this)
+		family := infrastructure.ModelFamilyAxientDigital
+		g.mu.RLock()
+		if info, ok := g.shureCtrls[addr]; ok && info.modelFamily != "" {
+			family = info.modelFamily
+		}
+		g.mu.RUnlock()
+
+		// Channel control params (use underscores - FormatParamName will convert for ULX-D/QLX-D)
+		controlParams := []string{
 			"AUDIO_GAIN", "AUDIO_MUTE", "CHAN_NAME",
-			"FREQUENCY", "GROUP_CHANNEL", "FD_MODE",
+			"FREQUENCY", "GROUP_CHANNEL",
 		}
 
 		for ch := 1; ch <= 4; ch++ {
-			for _, param := range channelParams {
-				ctrl.SendCommand(infrastructure.NewShureCommand("GET").
+			for _, param := range controlParams {
+				cmd := infrastructure.NewShureCommandWithModel("GET", family).
 					WithIndex(ch).
 					WithParam(param, nil).
-					Build())
+					Build()
+				ctrl.SendCommand(cmd)
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
 
-		// 3. Set METER_RATE to 1000ms for all channels 1-4
+		// 3. Query battery/telemetry params (common names across families)
+		telemetryParams := []string{
+			"TX_BATT_BARS", "TX_BATT_CHARGE_PERCENT", "TX_BATT_MINS",
+			"TX_BATT_TEMP_C", "TX_BATT_CYCLE_COUNT", "TX_BATT_HEALTH_PERCENT",
+		}
+
+		for ch := 1; ch <= 4; ch++ {
+			for _, param := range telemetryParams {
+				cmd := infrastructure.NewShureCommandWithModel("GET", family).
+					WithIndex(ch).
+					WithParam(param, nil).
+					Build()
+				ctrl.SendCommand(cmd)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		// 4. Set METER_RATE to 1000ms for all channels 1-4
 		for ch := 1; ch <= 4; ch++ {
 			ctrl.SendCommand(fmt.Sprintf("< SET %d METER_RATE 01000 >\n", ch))
 			time.Sleep(20 * time.Millisecond)
 		}
 
-		// 4. Start SAMPLE ALL for channels 1-4
+		// 5. Start SAMPLE ALL for channels 1-4
 		for ch := 1; ch <= 4; ch++ {
 			ctrl.SendCommand(fmt.Sprintf("< SAMPLE %d ALL >\n", ch))
 			time.Sleep(20 * time.Millisecond)
