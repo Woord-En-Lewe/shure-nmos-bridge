@@ -25,6 +25,7 @@ type shureDeviceInfo struct {
 	lastSeen       time.Time
 	modelFamily    infrastructure.ShureModelFamily // Detected model family
 	nmosDeviceIDs  map[int]string                  // channel -> deviceID
+	deviceIndex    int                             // Sequential index for OID generation
 	deviceOID      int                             // OID of the device block in NCP tree
 	deviceInstance string                          // Device instance name (e.g. from mDNS discovery)
 	parameterOIDs  map[string]int                  // param_key -> oid (e.g. "1_AUDIO_GAIN" -> 101)
@@ -35,21 +36,23 @@ type shureDeviceInfo struct {
 
 // gatewayImpl is the concrete implementation of the Gateway interface
 type gatewayImpl struct {
-	shureAddr  string
-	nmosAddr   string
-	shureCtrls map[string]*shureDeviceInfo
-	nmosCtrl   infrastructure.NMOSController
-	messageBus infrastructure.MessageBus
-	discoverer *infrastructure.ShureDiscoverer
-	mu         sync.RWMutex
+	shureAddr      string
+	nmosAddr       string
+	registryConfig infrastructure.RegistryDiscoveryConfig
+	shureCtrls     map[string]*shureDeviceInfo
+	nmosCtrl       infrastructure.NMOSController
+	messageBus     infrastructure.MessageBus
+	discoverer     *infrastructure.ShureDiscoverer
+	mu             sync.RWMutex
 }
 
 // NewGateway creates a new Gateway instance
-func NewGateway(shureAddr, nmosAddr string) Gateway {
+func NewGateway(shureAddr, nmosAddr string, registryConfig infrastructure.RegistryDiscoveryConfig) Gateway {
 	return &gatewayImpl{
-		shureAddr:  shureAddr,
-		nmosAddr:   nmosAddr,
-		shureCtrls: make(map[string]*shureDeviceInfo),
+		shureAddr:      shureAddr,
+		nmosAddr:       nmosAddr,
+		registryConfig: registryConfig,
+		shureCtrls:     make(map[string]*shureDeviceInfo),
 	}
 }
 
@@ -61,7 +64,7 @@ func (g *gatewayImpl) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to create message bus")
 	}
 
-	g.nmosCtrl = infrastructure.NewNMOSController(g.nmosAddr)
+	g.nmosCtrl = infrastructure.NewNMOSControllerWithConfig(g.nmosAddr, g.registryConfig)
 	if g.nmosCtrl == nil {
 		return fmt.Errorf("failed to create nmos controller")
 	}
@@ -153,11 +156,13 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 	}
 
 	deviceID := uuid.New().String()
-	deviceOID := 100 + (len(g.shureCtrls)+1)*10
+	deviceIndex := len(g.shureCtrls) + 1
+	deviceOID := 100 + deviceIndex*10
 	g.shureCtrls[addr] = &shureDeviceInfo{
 		ctrl:           ctrl,
 		lastSeen:       time.Now(),
 		nmosDeviceIDs:  map[int]string{0: deviceID},
+		deviceIndex:    deviceIndex,
 		deviceOID:      deviceOID,
 		deviceInstance: dev.Instance,
 		parameterOIDs:  make(map[string]int),
@@ -173,97 +178,76 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 	// Discovery Sequence
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		slog.Info("Requesting full device discovery", "address", addr)
+		slog.Info("Starting device discovery", "address", addr)
 
-		// 1. Get device-level parameters first (MODEL, DEVICE_ID, FW_VER) to detect family
-		ctrl.SendCommand(infrastructure.NewShureCommand("GET").
-			WithIndex(0).
-			WithParam("MODEL", nil).
-			Build())
-		ctrl.SendCommand(infrastructure.NewShureCommand("GET").
-			WithIndex(0).
+		// 1. Initial detection - GET 1 DEVICE_ID is safe for all receiver types
+		// This will trigger model family detection
+		detectCmd := infrastructure.NewShureCommand("GET").
+			WithIndex(1).
 			WithParam("DEVICE_ID", nil).
-			Build())
-		ctrl.SendCommand(infrastructure.NewShureCommand("GET").
-			WithIndex(0).
-			WithParam("FW_VER", nil).
-			Build())
+			Build()
+		slog.Info("Discovery GET 1 DEVICE_ID", "address", addr, "cmd", detectCmd)
+		ctrl.SendCommand(detectCmd)
 
-		// Wait for model detection before querying channel params
-		// The model family will be set when we receive REP(MODEL)
-		// Retry MODEL query if no response after 500ms
+		// Wait for model detection from DEVICE_ID response
+		// The model family will be set when we receive REP(DEVICE_ID)
+		family := infrastructure.ShureModelFamily("")
 		waited := 0
 		for {
 			time.Sleep(250 * time.Millisecond)
 			waited += 250
-			family := infrastructure.ModelFamilyAxientDigital
 			g.mu.RLock()
 			if info, ok := g.shureCtrls[addr]; ok && info.modelFamily != "" {
 				family = info.modelFamily
 			}
 			g.mu.RUnlock()
-			if family != infrastructure.ModelFamilyAxientDigital || waited >= 1000 {
+			if family != "" || waited >= 2000 {
 				break
 			}
-			// Retry MODEL query
-			ctrl.SendCommand(infrastructure.NewShureCommand("GET").
+		}
+
+		if family == "" {
+			slog.Warn("Model family not detected within timeout, defaulting to Axient Digital", "address", addr)
+			family = infrastructure.ModelFamilyAxientDigital
+		} else {
+			slog.Info("Model family detected", "address", addr, "family", family)
+		}
+
+		// 2. Query all available channels
+		maxChannels := family.MaxChannels()
+
+		// For multi-channel receivers (AD4Q, ULXD4Q), GET 0 ALL is efficient
+		if maxChannels > 1 && family == infrastructure.ModelFamilyAxientDigital {
+			getAllCmd := infrastructure.NewShureCommand("GET").
 				WithIndex(0).
-				WithParam("MODEL", nil).
-				Build())
+				WithParam("ALL", nil).
+				Build()
+			slog.Info("Discovery GET 0 ALL", "address", addr, "cmd", getAllCmd)
+			ctrl.SendCommand(getAllCmd)
+			time.Sleep(100 * time.Millisecond)
 		}
 
-		// 2. Query channel-specific parameters for channels 1-4
-		// Get current model family (may still be default, FormatParamName handles this)
-		family := infrastructure.ModelFamilyAxientDigital
-		g.mu.RLock()
-		if info, ok := g.shureCtrls[addr]; ok && info.modelFamily != "" {
-			family = info.modelFamily
-		}
-		g.mu.RUnlock()
-
-		// Channel control params (use underscores - FormatParamName will convert for ULX-D/QLX-D)
-		controlParams := []string{
-			"AUDIO_GAIN", "AUDIO_MUTE", "CHAN_NAME",
-			"FREQUENCY", "GROUP_CHANNEL",
-		}
-
-		for ch := 1; ch <= 4; ch++ {
-			for _, param := range controlParams {
-				cmd := infrastructure.NewShureCommandWithModel("GET", family).
-					WithIndex(ch).
-					WithParam(param, nil).
-					Build()
-				ctrl.SendCommand(cmd)
-			}
+		// Query each channel individually to ensure full state
+		for ch := 1; ch <= maxChannels; ch++ {
+			cmd := infrastructure.NewShureCommand("GET").
+				WithIndex(ch).
+				WithParam("ALL", nil).
+				Build()
+			slog.Info("Discovery GET ALL", "address", addr, "channel", ch, "cmd", cmd)
+			ctrl.SendCommand(cmd)
 			time.Sleep(50 * time.Millisecond)
 		}
 
-		// 3. Query battery/telemetry params (common names across families)
-		telemetryParams := []string{
-			"TX_BATT_BARS", "TX_BATT_CHARGE_PERCENT", "TX_BATT_MINS",
-			"TX_BATT_TEMP_C", "TX_BATT_CYCLE_COUNT", "TX_BATT_HEALTH_PERCENT",
-		}
-
-		for ch := 1; ch <= 4; ch++ {
-			for _, param := range telemetryParams {
-				cmd := infrastructure.NewShureCommandWithModel("GET", family).
-					WithIndex(ch).
-					WithParam(param, nil).
-					Build()
-				ctrl.SendCommand(cmd)
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-
-		// 4. Set METER_RATE to 1000ms for all channels 1-4
-		for ch := 1; ch <= 4; ch++ {
-			ctrl.SendCommand(fmt.Sprintf("< SET %d METER_RATE 01000 >\n", ch))
+		// 3. Set METER_RATE and Start SAMPLE for all channels
+		for ch := 1; ch <= maxChannels; ch++ {
+			meterCmd := fmt.Sprintf("< SET %d METER_RATE 01000 >\n", ch)
+			slog.Info("Discovery SET METER_RATE", "address", addr, "channel", ch, "cmd", meterCmd)
+			ctrl.SendCommand(meterCmd)
 			time.Sleep(20 * time.Millisecond)
-		}
 
-		// 5. Start SAMPLE ALL for channels 1-4
-		for ch := 1; ch <= 4; ch++ {
-			ctrl.SendCommand(fmt.Sprintf("< SAMPLE %d ALL >\n", ch))
+			sampleCmd := fmt.Sprintf("< SAMPLE %d ALL >\n", ch)
+			slog.Info("Discovery SAMPLE ALL", "address", addr, "channel", ch, "cmd", sampleCmd)
+			ctrl.SendCommand(sampleCmd)
 			time.Sleep(20 * time.Millisecond)
 		}
 	}()
@@ -312,16 +296,16 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		Name:    "GainWorker",
 		ClassID: []int{1, 2, 1, 1},
 		Properties: []infrastructure.NcPropertyDescriptor{
-			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean"},
-			{Name: "gain", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcFloat32"},
+			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+			{Name: "gain", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcFloat32"},
 		},
 	})
 	g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
 		Name:    "MuteWorker",
 		ClassID: []int{1, 2, 1, 2},
 		Properties: []infrastructure.NcPropertyDescriptor{
-			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean"},
-			{Name: "mute", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean"},
+			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+			{Name: "mute", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcBoolean"},
 		},
 	})
 
@@ -354,19 +338,7 @@ func (g *gatewayImpl) listenToShureEvents(ctx context.Context, addr string, even
 			}
 			if report, ok := ev.(*infrastructure.TPCIReport); ok {
 				// Log ALL responses for discovery debugging
-				if strings.Contains(report.Raw, "REP") {
-					slog.Debug("Axient Report Received",
-						"address", addr,
-						"raw", report.Raw)
-				}
-
-				// Log significant changes
-				if report.Param == "MODEL" || report.Param == "DEVICE_ID" || report.Param == "FW_VER" {
-					slog.Info("Axient Capability Discovered",
-						"address", addr,
-						"param", report.Param,
-						"value", report.Value)
-				}
+				slog.Info("Shure REP Received", "address", addr, "type", report.Type, "channel", report.Channel, "param", report.Param, "value", report.Value)
 
 				// Forward to message bus for NMOS translation
 				slog.Debug("listenToShureEvents sending to messageBus", "address", addr, "param", report.Param)
@@ -385,6 +357,16 @@ func (g *gatewayImpl) listenToShureEvents(ctx context.Context, addr string, even
 // Stop gracefully shuts down the gateway components
 func (g *gatewayImpl) Stop(ctx context.Context) error {
 	slog.Info("Gateway Stop called")
+
+	// Close message bus FIRST to unblock processMessages and listenToShureEvents
+	// This breaks the deadlock chain where g.mu blocks processMessages which blocks
+	// listenToShureEvents which blocks readEvents which blocks ShureController.Stop
+	slog.Info("Stopping message bus")
+	if mb, ok := g.messageBus.(*infrastructure.InMemoryMessageBus); ok {
+		mb.Close()
+	}
+	slog.Info("Message bus stopped")
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	slog.Info("Gateway Stop lock acquired")
@@ -414,13 +396,6 @@ func (g *gatewayImpl) Stop(ctx context.Context) error {
 		return err
 	}
 	slog.Info("NMOS controller stopped")
-
-	// Stop message bus
-	slog.Info("Stopping message bus")
-	if mb, ok := g.messageBus.(*infrastructure.InMemoryMessageBus); ok {
-		mb.Close()
-	}
-	slog.Info("Message bus stopped")
 
 	slog.Info("Gateway Stop complete")
 
@@ -539,6 +514,10 @@ func (g *gatewayImpl) ensureIS07Resources(info *shureDeviceInfo, channel int, pa
 		"transport":          "urn:x-nmos:transport:websocket",
 		"interface_bindings": []string{"eth0"},
 		"manifest_href":      nil,
+		"tags": map[string]interface{}{
+			"ext_is_07_source_id":    []string{sourceID},
+			"ext_is_07_rest_api_url": []string{fmt.Sprintf("http://%s/x-nmos/events/v1.0/sources/%s/", g.nmosAddr, sourceID)},
+		},
 		"transport_params": []map[string]interface{}{
 			{
 				"ext_is_07_rest_api_url": fmt.Sprintf("http://%s/x-nmos/events/v1.0/sources/%s/", g.nmosAddr, sourceID),
@@ -730,7 +709,9 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 
 		if shouldCreateWorker {
 			// Allocate a new OID for this parameter
-			oid = 1000 + len(info.parameterOIDs) + (len(g.shureCtrls) * 100)
+			// 1000 + (deviceIndex * 100) + (parameterCount)
+			// This ensures unique OIDs across devices
+			oid = 1000 + (info.deviceIndex * 100) + len(info.parameterOIDs)
 			info.parameterOIDs[paramKey] = oid
 
 			// Create Worker based on parameter type
@@ -769,7 +750,8 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 		if exists {
 			if obj := g.nmosCtrl.GetNCPObject(oid); obj != nil {
 				if worker, ok := obj.(*infrastructure.NcWorker); ok {
-					worker.SetProperty(infrastructure.NCPPropertyID{Level: 2, Index: 1}, report.Value)
+					// Use Level 3, Index 1 for the main value of the worker
+					worker.SetProperty(infrastructure.NCPPropertyID{Level: 3, Index: 1}, report.Value)
 				}
 			}
 		}
@@ -1011,16 +993,29 @@ func (g *gatewayImpl) reapStaleDevices(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			g.mu.Lock()
+			// Collect stale devices first
+			var staleAddrs []string
+			g.mu.RLock()
 			for addr, info := range g.shureCtrls {
-				// If we haven't seen the device for 2 minutes, remove it
 				if time.Since(info.lastSeen) > 2*time.Minute {
-					slog.Info("Removing stale Shure device", "address", addr)
-					info.ctrl.Stop(ctx)
-					delete(g.shureCtrls, addr)
+					staleAddrs = append(staleAddrs, addr)
 				}
 			}
-			g.mu.Unlock()
+			g.mu.RUnlock()
+
+			// Stop devices outside the lock to prevent deadlock
+			for _, addr := range staleAddrs {
+				g.mu.Lock()
+				info, ok := g.shureCtrls[addr]
+				g.mu.Unlock()
+				if ok {
+					slog.Info("Removing stale Shure device", "address", addr)
+					info.ctrl.Stop(ctx)
+					g.mu.Lock()
+					delete(g.shureCtrls, addr)
+					g.mu.Unlock()
+				}
+			}
 		}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -20,9 +21,44 @@ import (
 	"github.com/grandcat/zeroconf"
 )
 
+// DiscoveryMode defines how the registry is discovered
+type DiscoveryMode string
+
+const (
+	DiscoveryModeDNSSD  DiscoveryMode = "dns_sd"
+	DiscoveryModeMDNS                 = "mdns"
+	DiscoveryModeStatic               = "static"
+)
+
+// RegistryDiscoveryConfig configures how the NMOS registry is discovered
+type RegistryDiscoveryConfig struct {
+	Mode           DiscoveryMode // Discovery mode: dns_sd, mdns, or static
+	Domain         string        // DNS domain for DNS-SD discovery (e.g., "local.", "example.com.")
+	StaticRegistry string        // Static registry URL when Mode is static
+}
+
+// ncpClient represents a connected NCP client with synchronization for WebSocket writes
+type ncpClient struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
+}
+
+func (c *ncpClient) WriteJSON(v interface{}) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.WriteJSON(v)
+}
+
+func (c *ncpClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.Close()
+}
+
 // nmosController is the concrete implementation of NMOSController
 type nmosController struct {
 	registryURL    string
+	registryConfig RegistryDiscoveryConfig
 	nodeAddr       string
 	nodeID         string
 	httpClient     *http.Client
@@ -56,7 +92,7 @@ type nmosController struct {
 	// IS-12 NCP support
 	ncpObjects         map[int]NcObject
 	ncpMu              sync.RWMutex
-	ncpClients         map[*websocket.Conn]bool
+	ncpClients         map[*ncpClient]bool
 	ncpClientsMu       sync.Mutex
 	ncpSubscriptions   map[int]map[int]NcObject // subscriptionID -> (objectID -> object) for tracking subscriptions
 	ncpSubMu           sync.RWMutex
@@ -76,8 +112,16 @@ type nmosController struct {
 	registeredMu sync.RWMutex
 }
 
-// NewNMOSController creates a new NMOSController instance
+// NewNMOSController creates a new NMOSController instance with default DNS-SD/mDNS discovery
 func NewNMOSController(addr string) NMOSController {
+	return NewNMOSControllerWithConfig(addr, RegistryDiscoveryConfig{
+		Mode:   DiscoveryModeMDNS,
+		Domain: "local.",
+	})
+}
+
+// NewNMOSControllerWithConfig creates a new NMOSController instance with custom registry discovery config
+func NewNMOSControllerWithConfig(addr string, registryConfig RegistryDiscoveryConfig) NMOSController {
 	if addr == "" {
 		addr = "localhost:8080" // Default NMOS Node API address
 	}
@@ -87,12 +131,13 @@ func NewNMOSController(addr string) NMOSController {
 		nodeAddr:           addr,
 		nodeID:             nodeID,
 		registryURL:        "http://localhost:8000", // Default NMOS registry address
+		registryConfig:     registryConfig,
 		httpClient:         &http.Client{Timeout: 10 * time.Second},
 		heartbeatInterval:  5 * time.Second,
 		resources:          make(map[string][]interface{}),
 		deviceControls:     make(map[string][]map[string]interface{}),
 		ncpObjects:         make(map[int]NcObject),
-		ncpClients:         make(map[*websocket.Conn]bool),
+		ncpClients:         make(map[*ncpClient]bool),
 		ncpSubscriptions:   make(map[int]map[int]NcObject),
 		nextSubscriptionID: 1,
 		eventsChan:         make(chan interface{}, 100),
@@ -288,11 +333,50 @@ func (c *nmosController) reRegisterAll(ctx context.Context) {
 	}
 }
 
-// registerResourceToRegistry POSTs a resource to the NMOS registry
+func (c *nmosController) toSingular(resourceType string) string {
+	switch resourceType {
+	case "nodes":
+		return "node"
+	case "devices":
+		return "device"
+	case "sources":
+		return "source"
+	case "flows":
+		return "flow"
+	case "senders":
+		return "sender"
+	case "receivers":
+		return "receiver"
+	default:
+		return resourceType
+	}
+}
+
+func (c *nmosController) toPlural(resourceType string) string {
+	switch resourceType {
+	case "node":
+		return "nodes"
+	case "device":
+		return "devices"
+	case "source":
+		return "sources"
+	case "flow":
+		return "flows"
+	case "sender":
+		return "senders"
+	case "receiver":
+		return "receivers"
+	default:
+		return resourceType
+	}
+}
+
+// registerResourceToRegistry POSTs a resource to the NMOS IS-04 registry
 func (c *nmosController) registerResourceToRegistry(ctx context.Context, resourceType string, resource interface{}) error {
 	// Wrap resource in IS-04 resource envelope
+	// Per IS-04 spec, the "type" field in the POST body must be singular (e.g., "node", not "nodes")
 	wrapper := map[string]interface{}{
-		"type": resourceType,
+		"type": c.toSingular(resourceType),
 		"data": resource,
 	}
 
@@ -326,7 +410,8 @@ func (c *nmosController) registerResourceToRegistry(ctx context.Context, resourc
 
 // unregisterResourceFromRegistry DELETEs a resource from the NMOS registry
 func (c *nmosController) unregisterResourceFromRegistry(ctx context.Context, resourceType string, id string) error {
-	url := fmt.Sprintf("%s/x-nmos/registration/v1.3/resource/%s/%s", c.registryURL, resourceType, id)
+	// Per IS-04 spec, the resource type in the DELETE URL must be plural (e.g., "/nodes/", not "/node/")
+	url := fmt.Sprintf("%s/x-nmos/registration/v1.3/resource/%s/%s", c.registryURL, c.toPlural(resourceType), id)
 	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create unregistration request: %w", err)
@@ -397,8 +482,39 @@ func (c *nmosController) unregisterAll(ctx context.Context) {
 	}
 }
 
-// discoverRegistry searches for an NMOS registry via mDNS
+// discoverRegistry discovers the NMOS registry based on the configured discovery mode
 func (c *nmosController) discoverRegistry(ctx context.Context) (string, error) {
+	switch c.registryConfig.Mode {
+	case DiscoveryModeStatic:
+		return c.discoverStatic()
+	case DiscoveryModeMDNS:
+		return c.discoverDNS(ctx, "local.")
+	case DiscoveryModeDNSSD:
+		return c.discoverDNS(ctx, c.registryConfig.Domain)
+	default:
+		return c.discoverDNS(ctx, "local.")
+	}
+}
+
+// discoverStatic returns the statically configured registry URL
+func (c *nmosController) discoverStatic() (string, error) {
+	if c.registryConfig.StaticRegistry == "" {
+		return "", errors.New("static registry URL is not configured")
+	}
+	slog.Info("Using static registry URL", "url", c.registryConfig.StaticRegistry)
+	return c.registryConfig.StaticRegistry, nil
+}
+
+// discoverDNS discovers the registry via DNS-SD on the specified domain
+func (c *nmosController) discoverDNS(ctx context.Context, domain string) (string, error) {
+	if domain == "local." {
+		return c.discoverMDNS(ctx)
+	}
+	return c.discoverUnicastDNS(ctx, domain)
+}
+
+// discoverMDNS discovers the registry via mDNS (multicast DNS on local domain)
+func (c *nmosController) discoverMDNS(ctx context.Context) (string, error) {
 	resolver, err := zeroconf.NewResolver(nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to create mDNS resolver: %w", err)
@@ -407,10 +523,9 @@ func (c *nmosController) discoverRegistry(ctx context.Context) (string, error) {
 	entries := make(chan *zeroconf.ServiceEntry)
 	done := make(chan struct{})
 
-	go func(results <-chan *zeroconf.ServiceEntry) {
+	go func(ctx context.Context, results <-chan *zeroconf.ServiceEntry) {
 		defer close(done)
 		for entry := range results {
-			// Look for API version in TXT records
 			apiVersion := "v1.3"
 			for _, txt := range entry.Text {
 				if strings.HasPrefix(txt, "api_ver=") {
@@ -419,7 +534,6 @@ func (c *nmosController) discoverRegistry(ctx context.Context) (string, error) {
 				}
 			}
 
-			// Build registry URL
 			var host string
 			if len(entry.AddrIPv4) > 0 {
 				host = entry.AddrIPv4[0].String()
@@ -430,30 +544,26 @@ func (c *nmosController) discoverRegistry(ctx context.Context) (string, error) {
 			}
 
 			registryURL := fmt.Sprintf("http://%s:%d/x-nmos/%s/", host, entry.Port, apiVersion)
-			slog.Info("Discovered NMOS registry", "url", registryURL)
+			slog.Info("Discovered NMOS registry via mDNS", "url", registryURL)
 			select {
 			case entries <- entry:
 			case <-ctx.Done():
 				return
 			}
 		}
-	}(entries)
+	}(ctx, entries)
 
-	// Browse for NMOS registration service
-	err = resolver.Browse(ctx, "_nmos-registration._tcp", "local.", entries)
+	err = resolver.Browse(ctx, "_nmos-register._tcp", "local.", entries)
 	if err != nil {
-		return "", fmt.Errorf("failed to browse for registry: %w", err)
+		return "", fmt.Errorf("failed to browse for registry via mDNS: %w", err)
 	}
 
-	// Wait for first registry or timeout
 	select {
 	case <-ctx.Done():
 		return "", ctx.Err()
 	case <-done:
-		// No entries found
-		return "", errors.New("no registries found")
+		return "", errors.New("no registries found via mDNS")
 	case entry := <-entries:
-		// Found a registry
 		var host string
 		if len(entry.AddrIPv4) > 0 {
 			host = entry.AddrIPv4[0].String()
@@ -464,6 +574,38 @@ func (c *nmosController) discoverRegistry(ctx context.Context) (string, error) {
 		}
 		return fmt.Sprintf("http://%s:%d", host, entry.Port), nil
 	}
+}
+
+// discoverUnicastDNS discovers the registry via DNS-SD using standard unicast DNS
+func (c *nmosController) discoverUnicastDNS(ctx context.Context, domain string) (string, error) {
+	dnsName := fmt.Sprintf("_nmos-register._tcp.%s", strings.TrimSuffix(domain, "."))
+
+	_, srvResults, err := net.LookupSRV("", "", dnsName)
+	if err != nil {
+		return "", fmt.Errorf("failed to lookup SRV record for %s: %w", dnsName, err)
+	}
+
+	if len(srvResults) == 0 {
+		return "", fmt.Errorf("no SRV records found for %s", dnsName)
+	}
+
+	srvRecord := srvResults[0]
+	target := strings.TrimSuffix(srvRecord.Target, ".")
+	port := srvRecord.Port
+
+	txtRecords, _ := net.LookupTXT(dnsName)
+	apiVersion := "v1.3"
+	for _, txt := range txtRecords {
+		if strings.HasPrefix(txt, "api_ver=") {
+			apiVersion = strings.TrimPrefix(txt, "api_ver=")
+			break
+		}
+	}
+
+	registryURL := fmt.Sprintf("http://%s:%d/x-nmos/%s/", target, port, apiVersion)
+	slog.Info("Discovered NMOS registry via DNS-SD", "url", registryURL, "domain", domain)
+
+	return fmt.Sprintf("http://%s:%d", target, port), nil
 }
 
 // buildNodeResource creates the node resource for IS-04 registration
@@ -523,35 +665,43 @@ func (c *nmosController) startServer() error {
 func (c *nmosController) setupRouter() *chi.Mux {
 	r := chi.NewRouter()
 
+	r.Use(middleware.CleanPath)
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(corsMiddleware)
 
+	r.Get("/x-nmos/node/v1.3", c.handleNodeRoot)
 	r.Get("/x-nmos/node/v1.3/", c.handleNodeRoot)
+	r.Get("/x-nmos/node/v1.3/self", c.handleNodeSelf)
 	r.Get("/x-nmos/node/v1.3/self/", c.handleNodeSelf)
+	r.Get("/x-nmos/node/v1.3/devices", c.handleNodeDevices)
 	r.Get("/x-nmos/node/v1.3/devices/", c.handleNodeDevices)
-	r.Route("/x-nmos/node/v1.3/devices/{id}/controls/", func(r chi.Router) {
+	r.Route("/x-nmos/node/v1.3/devices/{id}/controls", func(r chi.Router) {
 		r.Get("/", c.handleDeviceControls)
 		r.Post("/", c.handleDeviceControls)
 		r.Put("/", c.handleDeviceControls)
 		r.Patch("/", c.handleDeviceControls)
 	})
+	r.Get("/x-nmos/node/v1.3/sources", c.handleNodeSources)
 	r.Get("/x-nmos/node/v1.3/sources/", c.handleNodeSources)
+	r.Get("/x-nmos/node/v1.3/flows", c.handleNodeFlows)
 	r.Get("/x-nmos/node/v1.3/flows/", c.handleNodeFlows)
+	r.Get("/x-nmos/node/v1.3/senders", c.handleNodeSenders)
 	r.Get("/x-nmos/node/v1.3/senders/", c.handleNodeSenders)
+	r.Get("/x-nmos/node/v1.3/receivers", c.handleNodeReceivers)
 	r.Get("/x-nmos/node/v1.3/receivers/", c.handleNodeReceivers)
 
 	r.Get("/x-nmos/node/v1.3/ncp", c.handleNCP)
 	r.Get("/x-nmos/node/v1.3/ncp/", c.handleNCP)
 
-	r.Route("/x-nmos/events/v1.0/", func(r chi.Router) {
+	r.Route("/x-nmos/events/v1.0", func(r chi.Router) {
 		r.Get("/", c.handleEventsRoot)
 		r.Get("/ws", c.handleWebsocket)
 		r.Get("/events", c.handleWebsocket)
 		r.Get("/devices/{deviceId}", c.handleWebsocket)
-		r.Route("/sources/", func(r chi.Router) {
+		r.Route("/sources", func(r chi.Router) {
 			r.Get("/", c.handleEventsSourcesList)
 			r.Route("/{sourceId}", func(r chi.Router) {
 				r.Get("/state", c.handleEventsSourceState)
@@ -560,11 +710,11 @@ func (c *nmosController) setupRouter() *chi.Mux {
 		})
 	})
 
-	r.Route("/x-nmos/connection/v1.1/", func(r chi.Router) {
+	r.Route("/x-nmos/connection/v1.1", func(r chi.Router) {
 		r.Get("/", c.handleConnectionRoot)
-		r.Route("/single/", func(r chi.Router) {
+		r.Route("/single", func(r chi.Router) {
 			r.Get("/", c.handleConnectionSingleRoot)
-			r.Route("/senders/", func(r chi.Router) {
+			r.Route("/senders", func(r chi.Router) {
 				r.Get("/", c.handleConnectionSendersList)
 				r.Route("/{senderId}", func(r chi.Router) {
 					r.Get("/active", c.handleConnectionSenderActive)
@@ -678,8 +828,8 @@ func (c *nmosController) BroadcastNCPNotification(oid int, eventID NCPEventID, e
 		},
 	}
 
-	for conn := range c.ncpClients {
-		if err := conn.WriteJSON(msg); err != nil {
+	for client := range c.ncpClients {
+		if err := client.WriteJSON(msg); err != nil {
 			slog.Warn("Failed to send NCP notification to client", "error", err)
 		}
 	}
@@ -719,8 +869,22 @@ func (c *nmosController) GetNCPObject(oid int) NcObject {
 	return c.ncpObjects[oid]
 }
 
+// isWebSocketUpgrade checks if the HTTP request is a proper WebSocket upgrade
+func isWebSocketUpgrade(r *http.Request) bool {
+	if r.Header.Get("Upgrade") == "" {
+		return false
+	}
+	return strings.Contains(strings.ToLower(r.Header.Get("Upgrade")), "websocket")
+}
+
 // handleNCP handles the /x-nmos/node/v1.3/ncp WebSocket endpoint
 func (c *nmosController) handleNCP(w http.ResponseWriter, r *http.Request) {
+	// Verify this is a proper WebSocket upgrade request
+	if !isWebSocketUpgrade(r) {
+		http.Error(w, "NCP endpoint requires WebSocket upgrade", http.StatusBadRequest)
+		return
+	}
+
 	conn, err := c.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		slog.Error("Failed to upgrade NCP connection", "error", err)
@@ -734,13 +898,15 @@ func (c *nmosController) handleNCP(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 
+	client := &ncpClient{conn: conn}
+
 	c.ncpClientsMu.Lock()
-	c.ncpClients[conn] = true
+	c.ncpClients[client] = true
 	c.ncpClientsMu.Unlock()
 
 	defer func() {
 		c.ncpClientsMu.Lock()
-		delete(c.ncpClients, conn)
+		delete(c.ncpClients, client)
 		c.ncpClientsMu.Unlock()
 		conn.Close()
 	}()
@@ -778,7 +944,7 @@ func (c *nmosController) handleNCP(w http.ResponseWriter, r *http.Request) {
 			}
 
 			conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			if err := conn.WriteJSON(respMsg); err != nil {
+			if err := client.WriteJSON(respMsg); err != nil {
 				slog.Error("Failed to send NCP response", "error", err)
 				break
 			}
@@ -790,7 +956,7 @@ func (c *nmosController) handleNCP(w http.ResponseWriter, r *http.Request) {
 				Subscriptions: subscribed,
 			}
 			conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			if err := conn.WriteJSON(respMsg); err != nil {
+			if err := client.WriteJSON(respMsg); err != nil {
 				slog.Error("Failed to send NCP subscription response", "error", err)
 				break
 			}
@@ -917,11 +1083,8 @@ func (c *nmosController) Stop(ctx context.Context) error {
 		c.eventsServer.Shutdown()
 	}
 
-	// Force close HTTP server and all connections
-	if c.httpServer != nil {
-		slog.Info("Closing NMOS Node API server")
-		c.httpServer.Close()
-	}
+	// Close all WebSocket connections gracefully to unblock handlers
+	c.closeAllWebsocketConnections()
 
 	// Wait for goroutines to finish (with timeout)
 	done := make(chan struct{})
@@ -934,6 +1097,12 @@ func (c *nmosController) Stop(ctx context.Context) error {
 		slog.Debug("All goroutines finished")
 	case <-time.After(5 * time.Second):
 		slog.Warn("Goroutines did not finish in time, continuing anyway")
+	}
+
+	// Force close HTTP server after handlers have exited
+	if c.httpServer != nil {
+		slog.Info("Closing NMOS Node API server")
+		c.httpServer.Close()
 	}
 
 	// Close events channel
@@ -1056,6 +1225,7 @@ func (c *nmosController) handleWebsocket(w http.ResponseWriter, r *http.Request)
 
 	slog.Info("New NMOS IS-07 websocket client connected")
 
+	c.wg.Add(1)
 	go func() {
 		defer func() {
 			c.mu.Lock()
@@ -1064,6 +1234,7 @@ func (c *nmosController) handleWebsocket(w http.ResponseWriter, r *http.Request)
 			c.mu.Unlock()
 			conn.Close()
 			slog.Info("NMOS IS-07 websocket client disconnected")
+			c.wg.Done()
 		}()
 
 		for {
@@ -1226,6 +1397,20 @@ func (c *nmosController) checkIS07Heartbeats(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (c *nmosController) closeAllWebsocketConnections() {
+	c.mu.Lock()
+	for conn := range c.clients {
+		conn.Close()
+	}
+	c.mu.Unlock()
+
+	c.ncpClientsMu.Lock()
+	for client := range c.ncpClients {
+		client.Close()
+	}
+	c.ncpClientsMu.Unlock()
 }
 
 // BroadcastEvent sends an IS-07 event to all connected websocket clients using the NMOS state message format
@@ -1447,6 +1632,7 @@ func (c *nmosController) GetControls(deviceID string) []map[string]interface{} {
 
 // RegisterResource registers a device, source, etc. with the NMOS Node API
 func (c *nmosController) RegisterResource(resourceType string, resource interface{}) error {
+	resourceType = c.toPlural(resourceType)
 	c.mu.Lock()
 
 	// If it's a map with an ID, check if it already exists
@@ -1536,23 +1722,37 @@ func (c *nmosController) RegisterResource(resourceType string, resource interfac
 
 // UpdateResource updates an existing NMOS resource
 func (c *nmosController) UpdateResource(resourceType string, id string, updateFn func(interface{}) interface{}) error {
+	resourceType = c.toPlural(resourceType)
 	c.mu.Lock()
 
+	var resourceIndex int
+	var found bool
 	for i, r := range c.resources[resourceType] {
 		if rMap, ok := r.(map[string]interface{}); ok {
 			if rMap["id"] == id {
-				updated := updateFn(r)
-				c.resources[resourceType][i] = updated
-				slog.Debug("Updated NMOS resource", "type", resourceType, "id", id)
-				c.mu.Unlock()
-				c.broadcastUpdate(resourceType, updated)
-				return nil
+				resourceIndex = i
+				found = true
+				break
 			}
 		}
 	}
+	if !found {
+		c.mu.Unlock()
+		return fmt.Errorf("resource not found: %s/%s", resourceType, id)
+	}
 
+	original := c.resources[resourceType][resourceIndex]
 	c.mu.Unlock()
-	return fmt.Errorf("resource not found: %s/%s", resourceType, id)
+
+	updated := updateFn(original)
+
+	c.mu.Lock()
+	c.resources[resourceType][resourceIndex] = updated
+	slog.Debug("Updated NMOS resource", "type", resourceType, "id", id)
+	c.mu.Unlock()
+
+	c.broadcastUpdate(resourceType, updated)
+	return nil
 }
 
 // RegisterNode registers a node with the NMOS IS-04 registry
@@ -1561,35 +1761,9 @@ func (c *nmosController) RegisterNode(node interface{}) error {
 		return errors.New("controller not running")
 	}
 
-	// Wrap node in IS-04 resource envelope (type + data)
-	resource := map[string]interface{}{
-		"type": "node",
-		"data": node,
-	}
-
-	// Convert to JSON
-	resourceJSON, err := json.Marshal(resource)
-	if err != nil {
-		return fmt.Errorf("failed to marshal resource: %w", err)
-	}
-
-	// Send POST request to NMOS IS-04 registry (IS-04 spec: /x-nmos/registration/v1.3/resource)
-	req, err := http.NewRequestWithContext(context.Background(), "POST",
-		fmt.Sprintf("%s/x-nmos/registration/v1.3/resource", c.registryURL),
-		bytes.NewReader(resourceJSON))
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to register node: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("NMOS registry returned error status: %d", resp.StatusCode)
+	// Use common registration function
+	if err := c.registerResourceToRegistry(context.Background(), "node", node); err != nil {
+		return err
 	}
 
 	// Store node locally
