@@ -180,16 +180,19 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		time.Sleep(500 * time.Millisecond)
 		slog.Info("Starting device discovery", "address", addr)
 
-		// 1. Initial detection - GET DEVICE_ID is device-level per Shure spec
-		// This will trigger model family detection
-		detectCmd := infrastructure.NewShureCommand("GET").
-			WithParam("DEVICE_ID", nil).
+		// 1. Initial detection - Try GET MODEL first
+		// This works for Axient Digital, ULX-D, SLX-D, SLX-D+
+		// QLX-D does not support GET MODEL (not a valid command for QLX-D)
+		// We NEVER use DEVICE_ID for model detection since it's user-settable
+		// and could be exploited to make the gateway behave as a different model
+		modelCmd := infrastructure.NewShureCommand("GET").
+			WithParam("MODEL", nil).
 			Build()
-		slog.Info("Discovery GET DEVICE_ID", "address", addr, "cmd", detectCmd)
-		ctrl.SendCommand(detectCmd)
+		slog.Info("Discovery GET MODEL", "address", addr, "cmd", modelCmd)
+		ctrl.SendCommand(modelCmd)
 
-		// Wait for model detection from DEVICE_ID response
-		// The model family will be set when we receive REP(DEVICE_ID)
+		// Wait for model detection from MODEL response
+		// If QLX-D (no MODEL support), we'll timeout
 		family := infrastructure.ShureModelFamily("")
 		waited := 0
 		for {
@@ -200,14 +203,17 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 				family = info.modelFamily
 			}
 			g.mu.RUnlock()
-			if family != "" || waited >= 2000 {
+			if family != "" || waited >= 1500 {
 				break
 			}
 		}
 
+		// If MODEL timed out, default to QLX-D
+		// QLX-D is the only documented model that doesn't support GET MODEL
+		// We NEVER trust user-settable fields (DEVICE_ID) for model detection
 		if family == "" {
-			slog.Warn("Model family not detected within timeout, defaulting to Axient Digital", "address", addr)
-			family = infrastructure.ModelFamilyAxientDigital
+			slog.Warn("Model family not detected, defaulting to QLX-D", "address", addr)
+			family = infrastructure.ModelFamilyQLXD
 		} else {
 			slog.Info("Model family detected", "address", addr, "family", family)
 		}

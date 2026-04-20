@@ -85,6 +85,8 @@ func (b *ShureCommandBuilder) Build() string {
 				valueStr = fmt.Sprintf("%03d", int(v))
 			case ULXDGain:
 				valueStr = fmt.Sprintf("%03d", int(v))
+			case SLXDGain:
+				valueStr = fmt.Sprintf("%03d", int(v))
 			case SLDXAudioLevel:
 				valueStr = fmt.Sprintf("%03d", int(v))
 			case AudioOutputLevelSwitch:
@@ -268,6 +270,8 @@ func (b *ShureCommandBuilderWithModel) Build() string {
 				valueStr = fmt.Sprintf("%03d", int(v))
 			case ULXDGain:
 				valueStr = fmt.Sprintf("%03d", int(v))
+			case SLXDGain:
+				valueStr = fmt.Sprintf("%03d", int(v))
 			case SLDXAudioLevel:
 				valueStr = fmt.Sprintf("%03d", int(v))
 			default:
@@ -294,7 +298,14 @@ type ULXDGain int
 func (g ULXDGain) ToDB() int      { return int(g) - 18 }
 func (g ULXDGain) String() string { return fmt.Sprintf("%03d", int(g)) }
 
+// SLXDGain handles the 18dB offset for SLX-D/SLX-D+ AUDIO_GAIN
+type SLXDGain int
+
+func (g SLXDGain) ToDB() int      { return int(g) - 18 }
+func (g SLXDGain) String() string { return fmt.Sprintf("%03d", int(g)) }
+
 // SLDXAudioLevel handles SLX-D/SLX-D+ audio levels (000-120, subtract 120 for dBFS)
+// Note: This is for metering values (dBFS), not the AUDIO_GAIN setting which uses SLXDGain
 type SLDXAudioLevel int
 
 func (l SLDXAudioLevel) ToDBFS() int { return int(l) - 120 }
@@ -1378,6 +1389,22 @@ const (
 	AudioOutputMic  AudioOutputLevelSwitch = "MIC"
 	AudioOutputLine AudioOutputLevelSwitch = "LINE"
 )
+
+// LockStatus represents transmitter lock status
+type LockStatus string
+
+const (
+	LockStatusOff  LockStatus = "OFF"
+	LockStatusMenu LockStatus = "MENU"
+	LockStatusAll  LockStatus = "ALL"
+)
+
+// GetLockStatusCommand queries transmitter lock status (SLX-D/SLX-D+)
+type GetLockStatusCommand struct{}
+
+func (c GetLockStatusCommand) String() string {
+	return NewShureCommand("GET").WithParam("LOCK_STATUS", nil).Build()
+}
 
 // RemotePairStatus represents Bluetooth remote pairing status
 type RemotePairStatus string
