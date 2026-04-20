@@ -588,7 +588,7 @@ func (c GetDeviceIDCommand) String() string {
 }
 
 // GetGroupChannelCommand requests the group and channel settings
-// Note: Shure uses GROUP_CHAN (abbreviated), not GROUP_CHANNEL
+// Uses GROUP_CHAN for ULX-D/QLX-D compatibility
 type GetGroupChannelCommand struct {
 	Channel int
 }
@@ -607,6 +607,28 @@ type SetGroupChannelCommand struct {
 func (c SetGroupChannelCommand) String() string {
 	groupChan := fmt.Sprintf("%02d,%02d", c.Group, c.ChannelNum)
 	return NewShureCommand("SET").WithIndex(c.Channel).WithParam("GROUP_CHAN", groupChan).Build()
+}
+
+// AxientGetGroupChannelCommand requests the group and channel settings for Axient Digital
+// Uses GROUP_CHANNEL per official Shure documentation for Axient
+type AxientGetGroupChannelCommand struct {
+	Channel int
+}
+
+func (c AxientGetGroupChannelCommand) String() string {
+	return NewShureCommand("GET").WithIndex(c.Channel).WithParam("GROUP_CHANNEL", nil).Build()
+}
+
+// AxientSetGroupChannelCommand sets the group and channel for Axient Digital (format: gg,cc)
+type AxientSetGroupChannelCommand struct {
+	Channel    int
+	Group      int
+	ChannelNum int
+}
+
+func (c AxientSetGroupChannelCommand) String() string {
+	groupChan := fmt.Sprintf("%02d,%02d", c.Group, c.ChannelNum)
+	return NewShureCommand("SET").WithIndex(c.Channel).WithParam("GROUP_CHANNEL", groupChan).Build()
 }
 
 // EncryptionMode represents encryption state
@@ -946,23 +968,23 @@ func (s SampleReport) AudioLevelPeakDBFS() int { return s.AudioLevelPeak - 120 }
 // AudioLevelRMSDBFS converts RMS level to dBFS (offset by 120)
 func (s SampleReport) AudioLevelRMSDBFS() int { return s.AudioLevelRMS - 120 }
 
-// RFRSSI_A_DBM converts RF RSSI to dBm (offset by 128)
-func (s SampleReport) RFRSSI_A_DBM() int { return s.RFRSSI_A - 128 }
+// RFRSSI_A_DBM converts RF RSSI to dBm (offset by 120 per Shure spec)
+func (s SampleReport) RFRSSI_A_DBM() int { return s.RFRSSI_A - 120 }
 
-// RFRSSI_B_DBM converts RF RSSI to dBm (offset by 128)
-func (s SampleReport) RFRSSI_B_DBM() int { return s.RFRSSI_B - 128 }
+// RFRSSI_B_DBM converts RF RSSI to dBm (offset by 120 per Shure spec)
+func (s SampleReport) RFRSSI_B_DBM() int { return s.RFRSSI_B - 120 }
 
-// RFRSSI_C_DBM converts RF RSSI to dBm (offset by 128)
-func (s SampleReport) RFRSSI_C_DBM() int { return s.RFRSSI_C - 128 }
+// RFRSSI_C_DBM converts RF RSSI to dBm (offset by 120 per Shure spec)
+func (s SampleReport) RFRSSI_C_DBM() int { return s.RFRSSI_C - 120 }
 
-// RFRSSI_D_DBM converts RF RSSI to dBm (offset by 128)
-func (s SampleReport) RFRSSI_D_DBM() int { return s.RFRSSI_D - 128 }
+// RFRSSI_D_DBM converts RF RSSI to dBm (offset by 120 per Shure spec)
+func (s SampleReport) RFRSSI_D_DBM() int { return s.RFRSSI_D - 120 }
 
-// RFRSSI_F1_DBM converts RF RSSI F1 to dBm (offset by 128)
-func (s SampleReport) RFRSSI_F1_DBM() int { return s.RFRSSI_F1 - 128 }
+// RFRSSI_F1_DBM converts RF RSSI F1 to dBm (offset by 120 per Shure spec)
+func (s SampleReport) RFRSSI_F1_DBM() int { return s.RFRSSI_F1 - 120 }
 
-// RFRSSI_F2_DBM converts RF RSSI F2 to dBm (offset by 128)
-func (s SampleReport) RFRSSI_F2_DBM() int { return s.RFRSSI_F2 - 128 }
+// RFRSSI_F2_DBM converts RF RSSI F2 to dBm (offset by 120 per Shure spec)
+func (s SampleReport) RFRSSI_F2_DBM() int { return s.RFRSSI_F2 - 120 }
 
 // ParseSampleReport parses the Axient Digital SAMPLE string format:
 // < SAMPLE ch ALL qual audBitmap audPeak audRms rfAntStats rfBitmapA rfRssiA rfBitmapB rfRssiB >

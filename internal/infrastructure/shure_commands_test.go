@@ -393,9 +393,9 @@ func TestParseSampleReport(t *testing.T) {
 	if report.AudioLevelRMSDBFS() != -75 {
 		t.Errorf("Expected RMS dBFS -75, got %d", report.AudioLevelRMSDBFS())
 	}
-	// Test RSSI dBm conversion (128 offset)
-	if report.RFRSSI_A_DBM() != -97 {
-		t.Errorf("Expected RSSI dBm -97, got %d", report.RFRSSI_A_DBM())
+	// Test RSSI dBm conversion (120 offset per Shure spec)
+	if report.RFRSSI_A_DBM() != -89 {
+		t.Errorf("Expected RSSI dBm -89, got %d", report.RFRSSI_A_DBM())
 	}
 }
 
