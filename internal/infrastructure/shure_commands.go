@@ -154,6 +154,20 @@ func (m ShureModelFamily) UseSpaces() bool {
 	return m == ModelFamilyULXD || m == ModelFamilyQLXD
 }
 
+// MaxChannels returns the maximum number of channels supported by the model family.
+func (m ShureModelFamily) MaxChannels() int {
+	switch m {
+	case ModelFamilyAxientDigital, ModelFamilyULXD:
+		return 4
+	case ModelFamilySLXD, ModelFamilySLXDPlus:
+		return 2
+	case ModelFamilyQLXD:
+		return 1
+	default:
+		return 1
+	}
+}
+
 // FormatParamName formats a parameter name according to the model family's conventions
 func (m ShureModelFamily) FormatParamName(param string) string {
 	if m.UseSpaces() {
@@ -550,30 +564,37 @@ func (c GetStatusCommand) String() string {
 }
 
 // GetModelCommand requests the model name of the receiver
-type GetModelCommand struct {
-	Channel int
-}
+// Device-level command - does not use channel index per Shure spec
+type GetModelCommand struct{}
 
 func (c GetModelCommand) String() string {
-	return NewShureCommand("GET").WithIndex(c.Channel).WithParam("MODEL", nil).Build()
+	return NewShureCommand("GET").WithParam("MODEL", nil).Build()
 }
 
 // GetFWVersionCommand requests the firmware version
-type GetFWVersionCommand struct {
-	Channel int
-}
+// Device-level command - does not use channel index per Shure spec
+type GetFWVersionCommand struct{}
 
 func (c GetFWVersionCommand) String() string {
-	return NewShureCommand("GET").WithIndex(c.Channel).WithParam("FW_VER", nil).Build()
+	return NewShureCommand("GET").WithParam("FW_VER", nil).Build()
+}
+
+// GetDeviceIDCommand requests the device ID
+// Device-level command - does not use channel index per Shure spec
+type GetDeviceIDCommand struct{}
+
+func (c GetDeviceIDCommand) String() string {
+	return NewShureCommand("GET").WithParam("DEVICE_ID", nil).Build()
 }
 
 // GetGroupChannelCommand requests the group and channel settings
+// Note: Shure uses GROUP_CHAN (abbreviated), not GROUP_CHANNEL
 type GetGroupChannelCommand struct {
 	Channel int
 }
 
 func (c GetGroupChannelCommand) String() string {
-	return NewShureCommand("GET").WithIndex(c.Channel).WithParam("GROUP_CHANNEL", nil).Build()
+	return NewShureCommand("GET").WithIndex(c.Channel).WithParam("GROUP_CHAN", nil).Build()
 }
 
 // SetGroupChannelCommand sets the group and channel (format: gg,cc)
@@ -585,7 +606,7 @@ type SetGroupChannelCommand struct {
 
 func (c SetGroupChannelCommand) String() string {
 	groupChan := fmt.Sprintf("%02d,%02d", c.Group, c.ChannelNum)
-	return NewShureCommand("SET").WithIndex(c.Channel).WithParam("GROUP_CHANNEL", groupChan).Build()
+	return NewShureCommand("SET").WithIndex(c.Channel).WithParam("GROUP_CHAN", groupChan).Build()
 }
 
 // EncryptionMode represents encryption state

@@ -228,29 +228,35 @@ func TestParseDeviceStatus(t *testing.T) {
 
 // Test new Axient-specific commands
 func TestAxientCommands(t *testing.T) {
-	// Test GetModelCommand
-	cmd := GetModelCommand{Channel: 1}
+	// Test GetModelCommand - device-level, no channel index
+	cmd := GetModelCommand{}
 	if !strings.Contains(cmd.String(), "MODEL") {
 		t.Errorf("Expected MODEL in command, got %s", cmd.String())
 	}
+	if strings.Contains(cmd.String(), "1") {
+		t.Errorf("Expected no channel index in device-level command, got %s", cmd.String())
+	}
 
-	// Test GetFWVersionCommand
-	cmd2 := GetFWVersionCommand{Channel: 1}
+	// Test GetFWVersionCommand - device-level, no channel index
+	cmd2 := GetFWVersionCommand{}
 	if !strings.Contains(cmd2.String(), "FW_VER") {
 		t.Errorf("Expected FW_VER in command, got %s", cmd2.String())
+	}
+	if strings.Contains(cmd2.String(), "1") {
+		t.Errorf("Expected no channel index in device-level command, got %s", cmd2.String())
 	}
 
 	// Test GetGroupChannelCommand
 	cmd3 := GetGroupChannelCommand{Channel: 2}
-	if !strings.Contains(cmd3.String(), "GROUP_CHANNEL") {
-		t.Errorf("Expected GROUP_CHANNEL in command, got %s", cmd3.String())
+	if !strings.Contains(cmd3.String(), "GROUP_CHAN") {
+		t.Errorf("Expected GROUP_CHAN in command, got %s", cmd3.String())
 	}
 
 	// Test SetGroupChannelCommand
 	cmd4 := SetGroupChannelCommand{Channel: 1, Group: 3, ChannelNum: 7}
 	cmd4Str := cmd4.String()
-	if !strings.Contains(cmd4Str, "GROUP_CHANNEL") {
-		t.Errorf("Expected GROUP_CHANNEL in command, got %s", cmd4Str)
+	if !strings.Contains(cmd4Str, "GROUP_CHAN") {
+		t.Errorf("Expected GROUP_CHAN in command, got %s", cmd4Str)
 	}
 	if !strings.Contains(cmd4Str, "03,07") {
 		t.Errorf("Expected 03,07 in command, got %s", cmd4Str)
