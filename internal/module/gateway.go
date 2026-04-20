@@ -180,13 +180,12 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		time.Sleep(500 * time.Millisecond)
 		slog.Info("Starting device discovery", "address", addr)
 
-		// 1. Initial detection - GET 1 DEVICE_ID is safe for all receiver types
+		// 1. Initial detection - GET DEVICE_ID is device-level per Shure spec
 		// This will trigger model family detection
 		detectCmd := infrastructure.NewShureCommand("GET").
-			WithIndex(1).
 			WithParam("DEVICE_ID", nil).
 			Build()
-		slog.Info("Discovery GET 1 DEVICE_ID", "address", addr, "cmd", detectCmd)
+		slog.Info("Discovery GET DEVICE_ID", "address", addr, "cmd", detectCmd)
 		ctrl.SendCommand(detectCmd)
 
 		// Wait for model detection from DEVICE_ID response
@@ -216,8 +215,9 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		// 2. Query all available channels
 		maxChannels := family.MaxChannels()
 
-		// For multi-channel receivers (AD4Q, ULXD4Q), GET 0 ALL is efficient
-		if maxChannels > 1 && family == infrastructure.ModelFamilyAxientDigital {
+		// For multi-channel receivers (Axient Digital, ULXD4D, ULXD4Q), GET 0 ALL is efficient
+		// Per Shure spec, channel "0" means "all channels"
+		if maxChannels > 1 && (family == infrastructure.ModelFamilyAxientDigital || family == infrastructure.ModelFamilyULXD) {
 			getAllCmd := infrastructure.NewShureCommand("GET").
 				WithIndex(0).
 				WithParam("ALL", nil).
@@ -238,16 +238,12 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 			time.Sleep(50 * time.Millisecond)
 		}
 
-		// 3. Set METER_RATE and Start SAMPLE for all channels
+		// 3. Set METER_RATE to enable push-based metering (SAMPLE responses)
+		// The device will automatically send SAMPLE responses at the configured interval
 		for ch := 1; ch <= maxChannels; ch++ {
 			meterCmd := fmt.Sprintf("< SET %d METER_RATE 01000 >\n", ch)
 			slog.Info("Discovery SET METER_RATE", "address", addr, "channel", ch, "cmd", meterCmd)
 			ctrl.SendCommand(meterCmd)
-			time.Sleep(20 * time.Millisecond)
-
-			sampleCmd := fmt.Sprintf("< SAMPLE %d ALL >\n", ch)
-			slog.Info("Discovery SAMPLE ALL", "address", addr, "channel", ch, "cmd", sampleCmd)
-			ctrl.SendCommand(sampleCmd)
 			time.Sleep(20 * time.Millisecond)
 		}
 	}()
