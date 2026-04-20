@@ -163,9 +163,65 @@ func (m ShureModelFamily) UseSpaces() bool {
 }
 
 // MaxChannels returns the maximum number of channels supported by the model family.
+// Note: For Axient Digital, AD4Q has 4 channels and AD4D has 2 channels.
 func (m ShureModelFamily) MaxChannels() int {
 	switch m {
-	case ModelFamilyAxientDigital, ModelFamilyULXD:
+	case ModelFamilyAxientDigital:
+		return 4 // AD4Q is 4ch, AD4D is 2ch - default to 4 for discovery
+	case ModelFamilyULXD:
+		return 4 // ULXD4 is 1ch, ULXD4D is 2ch, ULXD4Q is 4ch - default to 4
+	case ModelFamilySLXD, ModelFamilySLXDPlus:
+		return 2 // SLXD4 is 1ch, SLXD4D is 2ch - default to 2
+	case ModelFamilyQLXD:
+		return 1
+	default:
+		return 1
+	}
+}
+
+// MaxChannelsFromModel returns the actual channel count based on the model string.
+// This provides accurate channel count for devices that have variants.
+func MaxChannelsFromModel(model string) int {
+	modelUpper := strings.ToUpper(model)
+	// Axient Digital: AD4Q=4ch, AD4D=2ch
+	if strings.HasPrefix(modelUpper, "AD4Q") {
+		return 4
+	}
+	if strings.HasPrefix(modelUpper, "AD4D") {
+		return 2
+	}
+	// ULX-D: ULXD4=1ch, ULXD4D=2ch, ULXD4Q=4ch
+	if strings.HasPrefix(modelUpper, "ULXD4Q") {
+		return 4
+	}
+	if strings.HasPrefix(modelUpper, "ULXD4D") {
+		return 2
+	}
+	if strings.HasPrefix(modelUpper, "ULXD4") {
+		return 1
+	}
+	// SLX-D/SLX-D+: SLXD4=1ch, SLXD4D=2ch, SLXD4Q+=5ch
+	if strings.HasPrefix(modelUpper, "SLXD4Q+") {
+		return 4
+	}
+	if strings.HasPrefix(modelUpper, "SLXD4D+") {
+		return 2
+	}
+	if strings.HasPrefix(modelUpper, "SLXD4D") {
+		return 2
+	}
+	if strings.HasPrefix(modelUpper, "SLXD4+") || strings.HasPrefix(modelUpper, "SLXD4") {
+		return 1
+	}
+	// QLX-D is always 1 channel
+	if strings.HasPrefix(modelUpper, "QLXD") {
+		return 1
+	}
+	// Default to family max
+	switch DetectModelFamily(model) {
+	case ModelFamilyAxientDigital:
+		return 4
+	case ModelFamilyULXD:
 		return 4
 	case ModelFamilySLXD, ModelFamilySLXDPlus:
 		return 2
