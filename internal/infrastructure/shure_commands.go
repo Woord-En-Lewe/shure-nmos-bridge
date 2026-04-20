@@ -39,9 +39,9 @@ func (b *ShureCommandBuilder) Build() string {
 	sb.WriteString(b.command)
 	sb.WriteString(" ")
 
-	// Device level is 0, channels are 1-4
-	if b.index > 0 || (b.command == "GET" && b.index == 0 && len(b.params) > 0) {
-		// Note: Axient allows < GET 0 ALL >
+	// Only write channel index if explicitly set to > 0
+	// Device-level commands (DEVICE_ID, MODEL, FW_VER, etc.) use index 0 or no index
+	if b.index > 0 {
 		sb.WriteString(strconv.Itoa(b.index))
 		sb.WriteString(" ")
 	}
@@ -1263,60 +1263,57 @@ const (
 )
 
 // GetHighDensityModeCommand queries high density mode (ULX-D only)
-type GetHighDensityModeCommand struct {
-	Channel int
-}
+// Device-level command - no channel index per Shure spec
+type GetHighDensityModeCommand struct{}
 
 func (c GetHighDensityModeCommand) String() string {
-	return NewShureCommand("GET").WithIndex(c.Channel).WithParam("HIGH_DENSITY", nil).Build()
+	return NewShureCommand("GET").WithParam("HIGH_DENSITY", nil).Build()
 }
 
 // SetHighDensityModeCommand sets high density mode (ULX-D only)
+// Device-level command - no channel index per Shure spec
 type SetHighDensityModeCommand struct {
-	Channel int
-	Mode    HighDensityMode
+	Mode HighDensityMode
 }
 
 func (c SetHighDensityModeCommand) String() string {
-	return NewShureCommand("SET").WithIndex(c.Channel).WithParam("HIGH_DENSITY", c.Mode).Build()
+	return NewShureCommand("SET").WithParam("HIGH_DENSITY", c.Mode).Build()
 }
 
 // GetAudioSummingModeCommand queries audio summing mode (ULX-D only)
-type GetAudioSummingModeCommand struct {
-	Channel int
-}
+// Device-level command - no channel index per Shure spec
+type GetAudioSummingModeCommand struct{}
 
 func (c GetAudioSummingModeCommand) String() string {
-	return NewShureCommand("GET").WithIndex(c.Channel).WithParam("AUDIO_SUMMING_MODE", nil).Build()
+	return NewShureCommand("GET").WithParam("AUDIO_SUMMING_MODE", nil).Build()
 }
 
 // SetAudioSummingModeCommand sets audio summing mode (ULX-D only)
+// Device-level command - no channel index per Shure spec
 type SetAudioSummingModeCommand struct {
-	Channel int
-	Mode    AudioSummingMode
+	Mode AudioSummingMode
 }
 
 func (c SetAudioSummingModeCommand) String() string {
-	return NewShureCommand("SET").WithIndex(c.Channel).WithParam("AUDIO_SUMMING_MODE", c.Mode).Build()
+	return NewShureCommand("SET").WithParam("AUDIO_SUMMING_MODE", c.Mode).Build()
 }
 
 // GetFrequencyDiversityModeCommand queries frequency diversity mode (ULX-D only)
-type GetFrequencyDiversityModeCommand struct {
-	Channel int
-}
+// Device-level command - no channel index per Shure spec
+type GetFrequencyDiversityModeCommand struct{}
 
 func (c GetFrequencyDiversityModeCommand) String() string {
-	return NewShureCommand("GET").WithIndex(c.Channel).WithParam("FREQUENCY_DIVERSITY_MODE", nil).Build()
+	return NewShureCommand("GET").WithParam("FREQUENCY_DIVERSITY_MODE", nil).Build()
 }
 
 // SetFrequencyDiversityModeCommand sets frequency diversity mode (ULX-D only)
+// Device-level command - no channel index per Shure spec
 type SetFrequencyDiversityModeCommand struct {
-	Channel int
-	Mode    FrequencyDiversityMode
+	Mode FrequencyDiversityMode
 }
 
 func (c SetFrequencyDiversityModeCommand) String() string {
-	return NewShureCommand("SET").WithIndex(c.Channel).WithParam("FREQUENCY_DIVERSITY_MODE", c.Mode).Build()
+	return NewShureCommand("SET").WithParam("FREQUENCY_DIVERSITY_MODE", c.Mode).Build()
 }
 
 // GetEncryptionWarningCommand queries encryption warning state (ULX-D only)

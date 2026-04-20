@@ -591,30 +591,34 @@ func TestShureCommandBuilderWithModel(t *testing.T) {
 
 // Test ULX-D/QLX-D commands
 func TestULXDCommands(t *testing.T) {
-	// Test HighDensity
-	cmd := GetHighDensityModeCommand{Channel: 1}
+	// Test HighDensity - device-level, no channel index
+	cmd := GetHighDensityModeCommand{}
 	if !strings.Contains(cmd.String(), "HIGH_DENSITY") {
 		t.Errorf("Expected HIGH_DENSITY in command, got %s", cmd.String())
 	}
+	// Device-level commands should have no index after command
+	if strings.Contains(cmd.String(), "0 ") || strings.Contains(cmd.String(), "1 ") {
+		t.Errorf("Expected no channel index in device-level command, got %s", cmd.String())
+	}
 
-	cmd2 := SetHighDensityModeCommand{Channel: 1, Mode: HighDensityOn}
+	cmd2 := SetHighDensityModeCommand{Mode: HighDensityOn}
 	if !strings.Contains(cmd2.String(), "ON") {
 		t.Errorf("Expected ON in high density command, got %s", cmd2.String())
 	}
 
-	// Test Audio Summing
-	cmd3 := GetAudioSummingModeCommand{Channel: 1}
+	// Test Audio Summing - device-level, no channel index
+	cmd3 := GetAudioSummingModeCommand{}
 	if !strings.Contains(cmd3.String(), "AUDIO_SUMMING_MODE") {
 		t.Errorf("Expected AUDIO_SUMMING_MODE in command, got %s", cmd3.String())
 	}
 
-	cmd4 := SetAudioSummingModeCommand{Channel: 1, Mode: AudioSumming1Plus2}
+	cmd4 := SetAudioSummingModeCommand{Mode: AudioSumming1Plus2}
 	if !strings.Contains(cmd4.String(), "1+2") {
 		t.Errorf("Expected 1+2 in summing command, got %s", cmd4.String())
 	}
 
-	// Test Frequency Diversity
-	cmd5 := GetFrequencyDiversityModeCommand{Channel: 1}
+	// Test Frequency Diversity - device-level, no channel index
+	cmd5 := GetFrequencyDiversityModeCommand{}
 	if !strings.Contains(cmd5.String(), "FREQUENCY_DIVERSITY_MODE") {
 		t.Errorf("Expected FREQUENCY_DIVERSITY_MODE in command, got %s", cmd5.String())
 	}
