@@ -10,7 +10,7 @@ import (
 // Axient Digital Format: < COMMAND [INDEX] PARAMETER {VALUE} >
 type ShureCommandBuilder struct {
 	command string
-	index   int
+	index   *int // nil = device-level, 0 = all channels, 1-4 = specific channel
 	params  map[string]interface{}
 }
 
@@ -18,14 +18,21 @@ type ShureCommandBuilder struct {
 func NewShureCommand(command string) *ShureCommandBuilder {
 	return &ShureCommandBuilder{
 		command: strings.ToUpper(command),
-		index:   0,
+		index:   nil, // nil means device-level (no index in command)
 		params:  make(map[string]interface{}),
 	}
 }
 
+// WithIndex sets the channel index for channel-level commands
+// nil = device-level, 0 = all channels, 1-4 = specific channel
 func (b *ShureCommandBuilder) WithIndex(index int) *ShureCommandBuilder {
-	b.index = index
+	b.index = &index
 	return b
+}
+
+// WithChannel is an alias for WithIndex for clarity
+func (b *ShureCommandBuilder) WithChannel(channel int) *ShureCommandBuilder {
+	return b.WithIndex(channel)
 }
 
 func (b *ShureCommandBuilder) WithParam(key string, value interface{}) *ShureCommandBuilder {
@@ -39,10 +46,9 @@ func (b *ShureCommandBuilder) Build() string {
 	sb.WriteString(b.command)
 	sb.WriteString(" ")
 
-	// Only write channel index if explicitly set to > 0
-	// Device-level commands (DEVICE_ID, MODEL, FW_VER, etc.) use index 0 or no index
-	if b.index > 0 {
-		sb.WriteString(strconv.Itoa(b.index))
+	// Only write channel index if explicitly set (non-nil)
+	if b.index != nil {
+		sb.WriteString(strconv.Itoa(*b.index))
 		sb.WriteString(" ")
 	}
 
@@ -200,23 +206,23 @@ func DetectModelFamily(model string) ShureModelFamily {
 // ShureCommandBuilderWithModel creates a command builder with model family awareness
 type ShureCommandBuilderWithModel struct {
 	command string
-	index   int
+	index   *int // nil = device-level, 0 = all channels, 1-4 = specific channel
 	params  map[string]interface{}
 	family  ShureModelFamily
 }
 
-// NewShureCommandWithModel creates a new command builder for a specific model family
+// NewShureCommandWithModel creates a command builder for a specific model family
 func NewShureCommandWithModel(command string, family ShureModelFamily) *ShureCommandBuilderWithModel {
 	return &ShureCommandBuilderWithModel{
 		command: strings.ToUpper(command),
-		index:   0,
+		index:   nil, // nil means device-level (no index in command)
 		params:  make(map[string]interface{}),
 		family:  family,
 	}
 }
 
 func (b *ShureCommandBuilderWithModel) WithIndex(index int) *ShureCommandBuilderWithModel {
-	b.index = index
+	b.index = &index
 	return b
 }
 
@@ -231,8 +237,9 @@ func (b *ShureCommandBuilderWithModel) Build() string {
 	sb.WriteString(b.command)
 	sb.WriteString(" ")
 
-	if b.index > 0 || (b.command == "GET" && b.index == 0 && len(b.params) > 0) {
-		sb.WriteString(strconv.Itoa(b.index))
+	// Only write channel index if explicitly set (non-nil)
+	if b.index != nil {
+		sb.WriteString(strconv.Itoa(*b.index))
 		sb.WriteString(" ")
 	}
 
