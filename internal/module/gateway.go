@@ -121,6 +121,13 @@ func (g *gatewayImpl) handleDiscovery(ctx context.Context, devices <-chan infras
 				continue
 			}
 
+			// Filter out non-Shure devices (default to AxientDigital means unknown model)
+			family := infrastructure.DetectModelFamily(dev.Instance)
+			if family == infrastructure.ModelFamilyAxientDigital && !strings.HasPrefix(strings.ToUpper(dev.Instance), "AD") {
+				slog.Debug("Ignoring non-Shure device", "address", dev.Address, "port", dev.Port, "instance", dev.Instance)
+				continue
+			}
+
 			addr := fmt.Sprintf("%s:%d", dev.Address, dev.Port)
 			g.addShureController(ctx, addr, dev)
 		}
