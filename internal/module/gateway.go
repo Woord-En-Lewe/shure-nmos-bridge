@@ -689,7 +689,11 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 		shouldCreateWorker := !exists &&
 			report.Param != "METER_RATE" &&
 			report.Param != "SAMPLE" &&
-			report.Param != "FLASH"
+			report.Param != "FLASH" &&
+			report.Param != "FW_VER" &&
+			report.Param != "MODEL" &&
+			report.Param != "DEVICE_ID" &&
+			report.Param != "SERIAL_NUMBER"
 
 		if shouldCreateWorker {
 			// Allocate a new OID for this parameter
