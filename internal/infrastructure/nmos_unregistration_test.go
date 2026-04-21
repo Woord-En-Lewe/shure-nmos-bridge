@@ -70,8 +70,8 @@ func TestControlledUnregistration(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify deletions happened in the correct order
-	// Receivers -> Senders -> Flows -> Sources -> Devices -> Node
-	expectedOrder := []string{"receivers", "senders", "flows", "sources", "devices", "node"}
+	// Receivers -> Senders -> Flows -> Sources -> Devices -> Nodes
+	expectedOrder := []string{"receivers", "senders", "flows", "sources", "devices", "nodes"}
 
 	mu.Lock()
 	defer mu.Unlock()

@@ -55,7 +55,11 @@ func NewInMemoryMessageBus() MessageBus {
 			case <-mb.ctx.Done():
 				return
 			case msg := <-mb.sendChan:
-				mb.receiveChan <- msg
+				select {
+				case mb.receiveChan <- msg:
+				case <-mb.ctx.Done():
+					return
+				}
 			}
 		}
 	}()

@@ -158,9 +158,16 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 	deviceID := uuid.New().String()
 	deviceIndex := len(g.shureCtrls) + 1
 	deviceOID := 100 + deviceIndex*10
+
+	// Determine model family from discovery (mDNS broadcast contains model name)
+	// This is secure - the model string comes from device firmware, not user-settable
+	family := infrastructure.DetectModelFamily(dev.Instance)
+	slog.Info("Model family from discovery", "address", addr, "instance", dev.Instance, "family", family)
+
 	g.shureCtrls[addr] = &shureDeviceInfo{
 		ctrl:           ctrl,
 		lastSeen:       time.Now(),
+		modelFamily:    family, // Set from discovery, not user input
 		nmosDeviceIDs:  map[int]string{0: deviceID},
 		deviceIndex:    deviceIndex,
 		deviceOID:      deviceOID,
@@ -175,84 +182,42 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 	// Start event listener for this controller
 	go g.listenToShureEvents(ctx, addr, ctrl.ReceiveEvents())
 
-	// Discovery Sequence
-	go func() {
-		time.Sleep(500 * time.Millisecond)
-		slog.Info("Starting device discovery", "address", addr)
+	// On connection, we send GET x ALL for each channel and SET x METER_RATE
+	// Model family is already set from discovery (mDNS broadcast contains model name)
+	// Use actual channel count based on model variant (e.g. AD4Q=4, AD4D=2)
+	maxChannels := infrastructure.MaxChannelsFromModel(dev.Instance)
 
-		// 1. Initial detection - Try GET MODEL first
-		// This works for Axient Digital, ULX-D, SLX-D, SLX-D+
-		// QLX-D does not support GET MODEL (not a valid command for QLX-D)
-		// We NEVER use DEVICE_ID for model detection since it's user-settable
-		// and could be exploited to make the gateway behave as a different model
-		modelCmd := infrastructure.NewShureCommand("GET").
-			WithParam("MODEL", nil).
+	// For multi-channel receivers (Axient Digital, ULXD4D, ULXD4Q), GET 0 ALL is efficient
+	// Per Shure spec, channel "0" means "all channels"
+	if maxChannels > 1 && (family == infrastructure.ModelFamilyAxientDigital || family == infrastructure.ModelFamilyULXD) {
+		getAllCmd := infrastructure.NewShureCommand("GET").
+			WithIndex(0).
+			WithParam("ALL", nil).
 			Build()
-		slog.Info("Discovery GET MODEL", "address", addr, "cmd", modelCmd)
-		ctrl.SendCommand(modelCmd)
+		slog.Info("Discovery GET 0 ALL", "address", addr, "cmd", getAllCmd)
+		ctrl.SendCommand(getAllCmd)
+		time.Sleep(100 * time.Millisecond)
+	}
 
-		// Wait for model detection from MODEL response
-		// If QLX-D (no MODEL support), we'll timeout
-		family := infrastructure.ShureModelFamily("")
-		waited := 0
-		for {
-			time.Sleep(250 * time.Millisecond)
-			waited += 250
-			g.mu.RLock()
-			if info, ok := g.shureCtrls[addr]; ok && info.modelFamily != "" {
-				family = info.modelFamily
-			}
-			g.mu.RUnlock()
-			if family != "" || waited >= 1500 {
-				break
-			}
-		}
+	// Query each channel individually to ensure full state
+	for ch := 1; ch <= maxChannels; ch++ {
+		cmd := infrastructure.NewShureCommand("GET").
+			WithIndex(ch).
+			WithParam("ALL", nil).
+			Build()
+		slog.Info("Discovery GET ALL", "address", addr, "channel", ch, "cmd", cmd)
+		ctrl.SendCommand(cmd)
+		time.Sleep(50 * time.Millisecond)
+	}
 
-		// If MODEL timed out, default to QLX-D
-		// QLX-D is the only documented model that doesn't support GET MODEL
-		// We NEVER trust user-settable fields (DEVICE_ID) for model detection
-		if family == "" {
-			slog.Warn("Model family not detected, defaulting to QLX-D", "address", addr)
-			family = infrastructure.ModelFamilyQLXD
-		} else {
-			slog.Info("Model family detected", "address", addr, "family", family)
-		}
-
-		// 2. Query all available channels
-		maxChannels := family.MaxChannels()
-
-		// For multi-channel receivers (Axient Digital, ULXD4D, ULXD4Q), GET 0 ALL is efficient
-		// Per Shure spec, channel "0" means "all channels"
-		if maxChannels > 1 && (family == infrastructure.ModelFamilyAxientDigital || family == infrastructure.ModelFamilyULXD) {
-			getAllCmd := infrastructure.NewShureCommand("GET").
-				WithIndex(0).
-				WithParam("ALL", nil).
-				Build()
-			slog.Info("Discovery GET 0 ALL", "address", addr, "cmd", getAllCmd)
-			ctrl.SendCommand(getAllCmd)
-			time.Sleep(100 * time.Millisecond)
-		}
-
-		// Query each channel individually to ensure full state
-		for ch := 1; ch <= maxChannels; ch++ {
-			cmd := infrastructure.NewShureCommand("GET").
-				WithIndex(ch).
-				WithParam("ALL", nil).
-				Build()
-			slog.Info("Discovery GET ALL", "address", addr, "channel", ch, "cmd", cmd)
-			ctrl.SendCommand(cmd)
-			time.Sleep(50 * time.Millisecond)
-		}
-
-		// 3. Set METER_RATE to enable push-based metering (SAMPLE responses)
-		// The device will automatically send SAMPLE responses at the configured interval
-		for ch := 1; ch <= maxChannels; ch++ {
-			meterCmd := fmt.Sprintf("< SET %d METER_RATE 01000 >\n", ch)
-			slog.Info("Discovery SET METER_RATE", "address", addr, "channel", ch, "cmd", meterCmd)
-			ctrl.SendCommand(meterCmd)
-			time.Sleep(20 * time.Millisecond)
-		}
-	}()
+	// Set METER_RATE to enable push-based metering (SAMPLE responses)
+	// The device will automatically send SAMPLE responses at the configured interval
+	for ch := 1; ch <= maxChannels; ch++ {
+		meterCmd := fmt.Sprintf("< SET %d METER_RATE 01000 >\n", ch)
+		slog.Info("Discovery SET METER_RATE", "address", addr, "channel", ch, "cmd", meterCmd)
+		ctrl.SendCommand(meterCmd)
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	// Initial NMOS Registration
 	g.nmosCtrl.RegisterResource("devices", map[string]interface{}{

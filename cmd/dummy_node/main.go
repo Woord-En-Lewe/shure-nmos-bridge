@@ -107,14 +107,14 @@ func main() {
 		Name:    "GainWorker",
 		ClassID: []int{1, 2, 1, 1},
 		Properties: []infrastructure.NcPropertyDescriptor{
-			{Name: "gain", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcFloat32"},
+			{Name: "gain", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcFloat32"},
 		},
 	})
 	nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
 		Name:    "FaderWorker",
 		ClassID: []int{1, 2, 1, 2},
 		Properties: []infrastructure.NcPropertyDescriptor{
-			{Name: "fader", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcFloat32"},
+			{Name: "fader", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcFloat32"},
 		},
 	})
 
