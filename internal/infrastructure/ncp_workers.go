@@ -4,188 +4,232 @@ import (
 	"fmt"
 )
 
-// ParameterDefinition defines a single parameter for a model family
-type ParameterDefinition struct {
-	Name        string
-	ClassID     []int
-	IsReadOnly  bool
-	TypeName    string
-	Description string
-}
+// WorkerType defines the type of worker for proper class ID assignment
+type WorkerType int
 
-// ModelFamilyParameters maps model family to its channel parameter definitions
-// Based on official Shure command string documentation for each model
-var ModelFamilyParameters = map[ShureModelFamily][]ParameterDefinition{
+const (
+	WorkerTypeGain               WorkerType = 0
+	WorkerTypeMute              WorkerType = 1
+	WorkerTypeChannelName        WorkerType = 2
+	WorkerTypeFreq              WorkerType = 3
+	WorkerTypeGroupChan         WorkerType = 4
+	WorkerTypeTX                WorkerType = 5
+	WorkerTypeBattery           WorkerType = 6
+	WorkerTypeAudioLevel        WorkerType = 7
+	WorkerTypeRSSI              WorkerType = 8
+	WorkerTypeFWVer             WorkerType = 9
+	WorkerTypeDeviceID          WorkerType = 10
+	WorkerTypeEncryption        WorkerType = 11
+	WorkerTypeMACAddr           WorkerType = 12
+	WorkerTypeBattCycle         WorkerType = 13
+	WorkerTypeBattRunTime       WorkerType = 14
+	WorkerTypeBattTempF         WorkerType = 15
+	WorkerTypeBattTempC         WorkerType = 16
+	WorkerTypeBattType          WorkerType = 17
+	WorkerTypeBattCharge        WorkerType = 18
+	WorkerTypeBattHealth        WorkerType = 19
+	WorkerTypeBattBars          WorkerType = 20
+	WorkerTypeTxType            WorkerType = 21
+	WorkerTypeTxOffset          WorkerType = 22
+	WorkerTypeTxRFPower         WorkerType = 23
+	WorkerTypeTxPwrLock         WorkerType = 24
+	WorkerTypeTxMenuLock        WorkerType = 25
+	WorkerTypeTxDeviceID        WorkerType = 26
+	WorkerTypeTxMuteStatus      WorkerType = 27
+	WorkerTypeTxMuteButtonStatus WorkerType = 28
+	WorkerTypeTxPowerSource     WorkerType = 29
+	WorkerTypeEncryptionWarning WorkerType = 30
+	WorkerTypeAntStatus        WorkerType = 31
+	WorkerTypeRFLevel          WorkerType = 32
+	WorkerTypeAudioLevelMeter  WorkerType = 33
+)
+
+// WorkerTypeClassID maps worker type to class ID for a model family
+var WorkerTypeClassID = map[ShureModelFamily]map[WorkerType][]int{
 	ModelFamilyAxientDigital: {
-		// Channel Control Parameters
-		{Name: "AUDIO_GAIN", ClassID: []int{1, 2, 1, 1}, IsReadOnly: false, TypeName: "NcFloat32", Description: "Channel audio gain in dB (range -18 to 42)"},
-		{Name: "AUDIO_MUTE", ClassID: []int{1, 2, 1, 2}, IsReadOnly: false, TypeName: "NcBoolean", Description: "Channel audio mute state"},
-		{Name: "CHAN_NAME", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Channel name (31 chars max)"},
-		{Name: "FREQUENCY", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Frequency in MHz"},
-		{Name: "GROUP_CHANNEL", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Group/Channel mapping (format: gg,cc)"},
-		{Name: "FD_MODE", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Frequency diversity mode (OFF, FD-C, FD-S)"},
-		{Name: "ENCRYPTION_STATUS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Encryption status (OK, ERROR)"},
-		{Name: "ENCRYPTION_MODE", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Encryption mode (ON, OFF)"},
-		{Name: "INTERFERENCE_STATUS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Interference detection status (NONE, DETECTED)"},
-		{Name: "UNREGISTERED_TX_STATUS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Unregistered transmitter status (OK, ERROR)"},
-		{Name: "QUADVERSITY_MODE", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Quadversity mode (ON, OFF)"},
-		// RF Status (read-only)
-		{Name: "RF_BAND", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "RF band"},
-		{Name: "TRANSMISSION_MODE", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmission mode (STANDARD, HIGH_DENSITY)"},
-		// Transmitter Battery Parameters (read-only)
-		{Name: "TX_BATT_BARS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Transmitter battery bars (0-5, 255=unknown)"},
-		{Name: "TX_BATT_CHARGE_PERCENT", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Transmitter battery charge % (0-100, 255=unknown)"},
-		{Name: "TX_BATT_CYCLE_COUNT", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Transmitter battery cycle count"},
-		{Name: "TX_BATT_HEALTH_PERCENT", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Transmitter battery health %"},
-		{Name: "TX_BATT_MINS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Transmitter battery runtime minutes"},
-		{Name: "TX_BATT_TEMP_C", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcInt32", Description: "Transmitter battery temperature °C"},
-		{Name: "TX_BATT_TYPE", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter battery type (LION, ALKA, NIMH, LITH, UNKN)"},
-		{Name: "TX_DEVICE_ID", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter device ID"},
-		{Name: "TX_INPUT_PAD", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcInt32", Description: "Transmitter input pad status"},
-		{Name: "TX_LOCK", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter lock status (NONE, POWER, MENU, ALL, UNKNOWN)"},
-		{Name: "TX_MODEL", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter model (AD1, AD2, ADX1, ADX1M, ADX2, ADX2FD, UNKNOWN)"},
-		{Name: "TX_MUTE_MODE_STATUS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter mute mode status (ON, MUTE, UNKNOWN)"},
-		{Name: "TX_OFFSET", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcInt32", Description: "Transmitter offset (dB, range -12 to +21)"},
-		{Name: "TX_POLARITY", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter polarity (POSITIVE, NEGATIVE, UNKNOWN)"},
-		{Name: "TX_POWER_LEVEL", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Transmitter RF power level (mW)"},
-		{Name: "TX_TALK_SWITCH", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter talk switch status (ON, OFF, UNKNOWN)"},
-		// Metering Parameters (read-only)
-		{Name: "CHAN_QUALITY", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Channel quality (0-5)"},
-		{Name: "AUDIO_LEVEL_PEAK", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcFloat32", Description: "Audio peak level (dBFS)"},
-		{Name: "AUDIO_LEVEL_RMS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcFloat32", Description: "Audio RMS level (dBFS)"},
-		{Name: "AUDIO_LED_BITMAP", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Audio LED bitmap"},
-		{Name: "ANTENNA_STATUS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Antenna status (X=Off, R=Red, B=Blue)"},
-		{Name: "RSSI", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcFloat32", Description: "RF RSSI (dBm)"},
-		{Name: "RSSI_LED_BITMAP", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "RSSI LED bitmap"},
+		WorkerTypeGain:        []int{1, 2, 1, 10},
+		WorkerTypeMute:        []int{1, 2, 1, 11},
+		WorkerTypeChannelName: []int{1, 2, 1, 12},
+		WorkerTypeFreq:        []int{1, 2, 1, 13},
+		WorkerTypeGroupChan:   []int{1, 2, 1, 14},
+		WorkerTypeTX:          []int{1, 2, 1, 15},
+		WorkerTypeBattery:     []int{1, 2, 1, 16},
+		WorkerTypeAudioLevel:  []int{1, 2, 1, 17},
+		WorkerTypeRSSI:        []int{1, 2, 1, 18},
 	},
 	ModelFamilyULXD: {
-		// Channel Control Parameters
-		{Name: "AUDIO_GAIN", ClassID: []int{1, 2, 1, 1}, IsReadOnly: false, TypeName: "NcFloat32", Description: "Channel audio gain in dB (range -18 to 42)"},
-		{Name: "AUDIO_MUTE", ClassID: []int{1, 2, 1, 2}, IsReadOnly: false, TypeName: "NcBoolean", Description: "Channel audio mute state"},
-		{Name: "CHAN_NAME", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Channel name (8 chars max)"},
-		{Name: "FREQUENCY", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Frequency in KHz"},
-		{Name: "GROUP_CHAN", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Group/Channel mapping (format: gg,cc)"},
-		{Name: "ENCRYPTION_WARNING", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Encryption mismatch status (OFF, ON)"},
-		{Name: "RF_INT_DET", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "RF interference detection (NONE, CRITICAL)"},
-		// Metering Parameters (read-only)
-		{Name: "RF_ANTENNA", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "RF antenna status (AX, XB, AB, XX)"},
-		{Name: "RX_RF_LVL", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcFloat32", Description: "RF received level (dBm)"},
-		{Name: "AUDIO_LVL", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcFloat32", Description: "Audio level (dBFS)"},
-		// Transmitter Battery Parameters (read-only)
-		{Name: "BATT_BARS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Battery bars (0-5, 255=unknown)"},
-		{Name: "BATT_CHARGE", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Battery charge % (0-100, 255=unknown)"},
-		{Name: "BATT_CYCLE", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Battery cycle count"},
-		{Name: "BATT_HEALTH", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Battery health %"},
-		{Name: "BATT_RUN_TIME", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Battery runtime minutes"},
-		{Name: "BATT_TEMP_C", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcInt32", Description: "Battery temperature °C"},
-		{Name: "BATT_TYPE", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Battery type (LION, ALKA, NIMH, LITH, WARN, UNKN)"},
-		{Name: "TX_DEVICE_ID", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter device ID"},
-		{Name: "TX_FW_VER", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter firmware version"},
-		{Name: "TX_MENU_LOCK", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter menu lock status (ON, OFF, UNKN)"},
-		{Name: "TX_MUTE_BUTTON_STATUS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter mute button status (PRESSED, RELEASED, UNKN)"},
-		{Name: "TX_MUTE_STATUS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter mute status (ON, OFF, UNKN)"},
-		{Name: "TX_OFFSET", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcInt32", Description: "Transmitter offset (dB, range -12 to +21)"},
-		{Name: "TX_POWER_SOURCE", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter power source (BATTERY, EXTERNAL, UNKNOWN)"},
-		{Name: "TX_PWR_LOCK", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter power lock status (ON, OFF, UNKN)"},
-		{Name: "TX_RF_PWR", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter RF power (LOW, NORMAL, HIGH, UNKN)"},
-		{Name: "TX_TYPE", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter type (QLXD1, QLXD2, ULXD1, ULXD2, ULXD6, ULXD8, UNKN)"},
+		WorkerTypeGain:        []int{1, 2, 1, 10},
+		WorkerTypeMute:        []int{1, 2, 1, 11},
+		WorkerTypeChannelName: []int{1, 2, 1, 12},
+		WorkerTypeFreq:        []int{1, 2, 1, 13},
+		WorkerTypeGroupChan:   []int{1, 2, 1, 14},
+		WorkerTypeTX:          []int{1, 2, 1, 15},
+		WorkerTypeBattery:     []int{1, 2, 1, 16},
+		WorkerTypeAudioLevel:  []int{1, 2, 1, 17},
+		WorkerTypeRSSI:        []int{1, 2, 1, 18},
 	},
 	ModelFamilyQLXD: {
-		// Channel Control Parameters
-		{Name: "AUDIO_GAIN", ClassID: []int{1, 2, 1, 1}, IsReadOnly: false, TypeName: "NcFloat32", Description: "Channel audio gain in dB (range -18 to 42)"},
-		{Name: "AUDIO_MUTE", ClassID: []int{1, 2, 1, 2}, IsReadOnly: false, TypeName: "NcBoolean", Description: "Channel audio mute state"},
-		{Name: "CHAN_NAME", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Channel name (8 chars max)"},
-		{Name: "FREQUENCY", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Frequency in MHz (format: yyy.yyy)"},
-		{Name: "GROUP_CHAN", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Group/Channel mapping (format: gg,cc)"},
-		// Transmitter Battery Parameters (read-only)
-		{Name: "BATT_BARS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Battery bars (0-5, 255=unknown)"},
-		{Name: "BATT_CHARGE", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Battery charge % (0-100)"},
-		{Name: "BATT_HEALTH", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Battery health %"},
-		{Name: "BATT_RUN_TIME", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Battery runtime minutes"},
-		{Name: "BATT_TEMP_C", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcInt32", Description: "Battery temperature °C (offset by 40)"},
-		{Name: "BATT_TEMP_F", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcInt32", Description: "Battery temperature °F (offset by 40)"},
-		{Name: "BATT_CYCLE", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Battery cycle count"},
-		{Name: "BATT_TYPE", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Battery type (LION, ALKA, NIMH, LITH, UNKN)"},
-		// Transmitter Parameters (read-only)
-		{Name: "TX_TYPE", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter type (QLXD1, QLXD2, ULXD1, ULXD2, ULXD6, ULXD8, UNKN)"},
-		{Name: "TX_OFFSET", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Transmitter offset (dB)"},
-		{Name: "TX_RF_PWR", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter RF power (LOW, HIGH, UNKN)"},
-		{Name: "TX_PWR_LOCK", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter power lock status (ON, OFF, UNKN)"},
-		{Name: "TX_MENU_LOCK", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter menu lock status (ON, OFF, UNKN)"},
-		{Name: "TX_DEVICE_ID", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter device ID"},
-		{Name: "TX_MUTE_STATUS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter mute status (ON, OFF, UNKN)"},
-		{Name: "TX_MUTE_BUTTON_STATUS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter mute button status (PRESSED, RELEASED, UNKN)"},
-		{Name: "TX_POWER_SOURCE", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter power source (BATTERY, EXTERNAL, UNKN)"},
-		{Name: "ENCRYPTION_WARNING", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Encryption mismatch status (OFF, ON)"},
-		// Metering Parameters (read-only)
-		{Name: "RF_ANTENNA", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "RF antenna status (AX, XB, AB, XX)"},
+		WorkerTypeGain:               []int{1, 2, 1, 10},
+		WorkerTypeMute:              []int{1, 2, 1, 11},
+		WorkerTypeChannelName:       []int{1, 2, 1, 12},
+		WorkerTypeFreq:              []int{1, 2, 1, 13},
+		WorkerTypeGroupChan:         []int{1, 2, 1, 14},
+		WorkerTypeBattery:           []int{1, 2, 1, 16},
+		WorkerTypeAudioLevel:        []int{1, 2, 1, 17},
+		WorkerTypeRSSI:              []int{1, 2, 1, 18},
+		WorkerTypeFWVer:             []int{1, 2, 1, 19},
+		WorkerTypeDeviceID:          []int{1, 2, 1, 20},
+		WorkerTypeEncryption:        []int{1, 2, 1, 21},
+		WorkerTypeMACAddr:           []int{1, 2, 1, 22},
+		WorkerTypeBattCycle:         []int{1, 2, 1, 23},
+		WorkerTypeBattRunTime:       []int{1, 2, 1, 24},
+		WorkerTypeBattTempF:         []int{1, 2, 1, 25},
+		WorkerTypeBattTempC:         []int{1, 2, 1, 26},
+		WorkerTypeBattType:          []int{1, 2, 1, 27},
+		WorkerTypeBattCharge:        []int{1, 2, 1, 28},
+		WorkerTypeBattHealth:        []int{1, 2, 1, 29},
+		WorkerTypeBattBars:          []int{1, 2, 1, 30},
+		WorkerTypeTxType:           []int{1, 2, 1, 31},
+		WorkerTypeTxOffset:         []int{1, 2, 1, 32},
+		WorkerTypeTxRFPower:        []int{1, 2, 1, 33},
+		WorkerTypeTxPwrLock:        []int{1, 2, 1, 34},
+		WorkerTypeTxMenuLock:       []int{1, 2, 1, 35},
+		WorkerTypeTxDeviceID:       []int{1, 2, 1, 36},
+		WorkerTypeTxMuteStatus:     []int{1, 2, 1, 37},
+		WorkerTypeTxMuteButtonStatus: []int{1, 2, 1, 38},
+		WorkerTypeTxPowerSource:    []int{1, 2, 1, 39},
+		WorkerTypeEncryptionWarning: []int{1, 2, 1, 40},
+		WorkerTypeAntStatus:        []int{1, 2, 1, 41},
+		WorkerTypeRFLevel:          []int{1, 2, 1, 42},
+		WorkerTypeAudioLevelMeter:  []int{1, 2, 1, 43},
 	},
 	ModelFamilySLXD: {
-		// Channel Control Parameters
-		{Name: "AUDIO_GAIN", ClassID: []int{1, 2, 1, 1}, IsReadOnly: false, TypeName: "NcFloat32", Description: "Channel audio gain in dB (range -18 to 42)"},
-		{Name: "AUDIO_MUTE", ClassID: []int{1, 2, 1, 2}, IsReadOnly: false, TypeName: "NcBoolean", Description: "Channel audio mute state"},
-		{Name: "CHAN_NAME", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Channel name (31 chars max, SET takes 8)"},
-		{Name: "FREQUENCY", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Frequency in KHz"},
-		{Name: "GROUP_CHANNEL", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Group/Channel mapping"},
-		// Metering Parameters (read-only)
-		{Name: "AUDIO_LEVEL_PEAK", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcFloat32", Description: "Audio peak level (dBFS)"},
-		{Name: "AUDIO_LEVEL_RMS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcFloat32", Description: "Audio RMS level (dBFS)"},
-		{Name: "RSSI", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcFloat32", Description: "RF RSSI (dBm)"},
-		// Transmitter Parameters (read-only)
-		{Name: "TX_MODEL", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Transmitter model (SLXD1, SLXD2, UNKNOWN)"},
-		{Name: "TX_BATT_BARS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Transmitter battery bars (0-5, 255=unknown)"},
-		{Name: "TX_BATT_MINS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Transmitter battery runtime minutes"},
+		WorkerTypeGain:        []int{1, 2, 1, 10},
+		WorkerTypeMute:        []int{1, 2, 1, 11},
+		WorkerTypeChannelName: []int{1, 2, 1, 12},
+		WorkerTypeFreq:        []int{1, 2, 1, 13},
+		WorkerTypeGroupChan:   []int{1, 2, 1, 14},
+		WorkerTypeTX:          []int{1, 2, 1, 15},
+		WorkerTypeBattery:     []int{1, 2, 1, 16},
+		WorkerTypeAudioLevel:  []int{1, 2, 1, 17},
+		WorkerTypeRSSI:        []int{1, 2, 1, 18},
 	},
 	ModelFamilySLXDPlus: {
-		// Channel Control Parameters
-		{Name: "AUDIO_GAIN", ClassID: []int{1, 2, 1, 1}, IsReadOnly: false, TypeName: "NcFloat32", Description: "Channel audio gain in dB (range -18 to 42)"},
-		{Name: "AUDIO_MUTE", ClassID: []int{1, 2, 1, 2}, IsReadOnly: false, TypeName: "NcBoolean", Description: "Channel audio mute state"},
-		{Name: "CHAN_NAME", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Channel name (31 chars max)"},
-		{Name: "AUDIO_OUT_LVL_SWITCH", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Audio output level switch (MIC, LINE)"},
-		{Name: "GROUP_CHANNEL", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Group/Channel mapping"},
-		{Name: "REM_PAIR", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Remote pairing status (ON, OFF, REQUEST, ACCEPT, REJECT)"},
-		{Name: "INTERFERENCE_STATUS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Interference status (NONE, DETECTED)"},
-		{Name: "ENCRYPTION_STATUS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Encryption status (OK, ERROR)"},
-		{Name: "ENCRYPTION_MODE", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Encryption mode (ON, OFF)"},
-		{Name: "FREQUENCY", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Frequency in KHz"},
-		// Metering Parameters (read-only)
-		{Name: "AUDIO_LEVEL_PEAK", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcFloat32", Description: "Audio peak level (dBFS)"},
-		{Name: "AUDIO_LEVEL_RMS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcFloat32", Description: "Audio RMS level (dBFS)"},
-		{Name: "RSSI", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcFloat32", Description: "RF RSSI (dBm)"},
-		// Transmitter Parameters (read-only)
-		{Name: "LINK_TX_MODEL", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Linked transmitter model (SLXD1+, SLXD2+, SLXD3+, UNKNOWN)"},
-		{Name: "LINK_STATUS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcString", Description: "Link status (EMPTY, LINKED.INACTIVE, LINKED.ACTIVE)"},
-		{Name: "LINK_TX_BATT_MINS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Linked transmitter battery runtime minutes"},
-		{Name: "TX_BATT_BARS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Transmitter battery bars"},
-		{Name: "TX_BATT_MINS", ClassID: []int{1, 2, 2}, IsReadOnly: true, TypeName: "NcUint32", Description: "Transmitter battery runtime minutes"},
-		// Transmitter Control Parameters
-		{Name: "LINK_TX_REBOOT", ClassID: []int{1, 2, 2}, IsReadOnly: false, TypeName: "NcString", Description: "Reboot linked transmitter command"},
+		WorkerTypeGain:        []int{1, 2, 1, 10},
+		WorkerTypeMute:        []int{1, 2, 1, 11},
+		WorkerTypeChannelName: []int{1, 2, 1, 12},
+		WorkerTypeFreq:        []int{1, 2, 1, 13},
+		WorkerTypeGroupChan:   []int{1, 2, 1, 14},
+		WorkerTypeTX:          []int{1, 2, 1, 15},
+		WorkerTypeBattery:     []int{1, 2, 1, 16},
+		WorkerTypeAudioLevel:  []int{1, 2, 1, 17},
+		WorkerTypeRSSI:        []int{1, 2, 1, 18},
 	},
 }
 
-// GetParametersForFamily returns parameter definitions for a model family
-func GetParametersForFamily(family ShureModelFamily) []ParameterDefinition {
-	if params, ok := ModelFamilyParameters[family]; ok {
-		return params
+// GetClassIDForWorker returns the class ID for a worker type in a given model family
+func GetClassIDForWorker(family ShureModelFamily, wt WorkerType) []int {
+	if familyMap, ok := WorkerTypeClassID[family]; ok {
+		if classID, ok := familyMap[wt]; ok {
+			return classID
+		}
 	}
-	return nil
+	return []int{1, 2, 1, 99} // fallback
 }
 
-// CreateWorkersForChannel creates all workers for a specific channel
-func CreateWorkersForChannel(family ShureModelFamily, channel int, baseOID int, ctrl ShureController) []*NcWorker {
-	params := GetParametersForFamily(family)
-	if params == nil {
+// ChannelWorkerConfig defines a single parameter worker for a channel
+type ChannelWorkerConfig struct {
+	WorkerType WorkerType
+	Name       string
+	ShureParam string // Shure command parameter name (e.g., "AUDIO_GAIN")
+	ClassID    []int
+	IsReadOnly bool
+	TypeName   string
+}
+
+// ChannelWorkersConfig returns the list of workers needed per channel for a model family
+func ChannelWorkersConfig(family ShureModelFamily) []ChannelWorkerConfig {
+	switch family {
+	case ModelFamilyAxientDigital:
+		return []ChannelWorkerConfig{
+			{WorkerTypeGain, "Gain", "AUDIO_GAIN", []int{1, 2, 1, 10}, false, "NcFloat32"},
+			{WorkerTypeMute, "Mute", "AUDIO_MUTE", []int{1, 2, 1, 11}, false, "NcBoolean"},
+			{WorkerTypeChannelName, "ChannelName", "CH_NAME", []int{1, 2, 1, 12}, false, "NcString"},
+			{WorkerTypeFreq, "Frequency", "FREQUENCY", []int{1, 2, 1, 13}, false, "NcString"},
+			{WorkerTypeGroupChan, "GroupChannel", "GROUP_CHAN", []int{1, 2, 1, 14}, false, "NcString"},
+			{WorkerTypeTX, "Transmitter", "TX_ALL", []int{1, 2, 1, 15}, true, "NcString"},
+			{WorkerTypeBattery, "Battery", "BATT_ALL", []int{1, 2, 1, 16}, true, "NcString"},
+			{WorkerTypeAudioLevel, "AudioLevel", "AUDIO_LEVEL", []int{1, 2, 1, 17}, true, "NcString"},
+			{WorkerTypeRSSI, "RSSI", "RF_RSSI", []int{1, 2, 1, 18}, true, "NcString"},
+		}
+	case ModelFamilyULXD:
+		return []ChannelWorkerConfig{
+			{WorkerTypeGain, "Gain", "AUDIO_GAIN", []int{1, 2, 1, 10}, false, "NcFloat32"},
+			{WorkerTypeMute, "Mute", "AUDIO_MUTE", []int{1, 2, 1, 11}, false, "NcBoolean"},
+			{WorkerTypeChannelName, "ChannelName", "CHAN_NAME", []int{1, 2, 1, 12}, false, "NcString"},
+			{WorkerTypeFreq, "Frequency", "FREQUENCY", []int{1, 2, 1, 13}, false, "NcString"},
+			{WorkerTypeGroupChan, "GroupChannel", "GROUP_CHAN", []int{1, 2, 1, 14}, false, "NcString"},
+			{WorkerTypeTX, "Transmitter", "TX_TYPE", []int{1, 2, 1, 15}, true, "NcString"},
+			{WorkerTypeBattery, "Battery", "TX_BATT_MINS", []int{1, 2, 1, 16}, true, "NcString"},
+			{WorkerTypeAudioLevel, "AudioLevel", "AUDIO_LVL", []int{1, 2, 1, 17}, true, "NcString"},
+			{WorkerTypeRSSI, "RSSI", "RX_RF_LVL", []int{1, 2, 1, 18}, true, "NcString"},
+		}
+	case ModelFamilyQLXD:
+		return []ChannelWorkerConfig{
+			{WorkerTypeChannelName, "ChannelName", "CHAN_NAME", []int{1, 2, 1, 12}, false, "NcString"},
+			{WorkerTypeFreq, "Frequency", "FREQUENCY", []int{1, 2, 1, 13}, false, "NcString"},
+			{WorkerTypeGroupChan, "GroupChannel", "GROUP_CHAN", []int{1, 2, 1, 14}, false, "NcString"},
+			{WorkerTypeEncryptionWarning, "EncryptionWarning", "ENCRYPTION_WARNING", []int{1, 2, 1, 40}, true, "NcBoolean"},
+			{WorkerTypeAntStatus, "AntennaStatus", "ANT_STATUS", []int{1, 2, 1, 41}, true, "NcString"},
+			{WorkerTypeRFLevel, "RFLevel", "RF_LEVEL", []int{1, 2, 1, 42}, true, "NcString"},
+			{WorkerTypeAudioLevelMeter, "AudioLevel", "AUDIO_LEVEL", []int{1, 2, 1, 43}, true, "NcString"},
+		}
+	case ModelFamilySLXD:
+		return []ChannelWorkerConfig{
+			{WorkerTypeGain, "Gain", "AUDIO_GAIN", []int{1, 2, 1, 10}, false, "NcFloat32"},
+			{WorkerTypeMute, "Mute", "AUDIO_MUTE", []int{1, 2, 1, 11}, false, "NcBoolean"},
+			{WorkerTypeChannelName, "ChannelName", "CHAN_NAME", []int{1, 2, 1, 12}, false, "NcString"},
+			{WorkerTypeFreq, "Frequency", "FREQUENCY", []int{1, 2, 1, 13}, false, "NcString"},
+			{WorkerTypeGroupChan, "GroupChannel", "GROUP_CHANNEL", []int{1, 2, 1, 14}, false, "NcString"},
+			{WorkerTypeTX, "Transmitter", "TX_MODEL", []int{1, 2, 1, 15}, true, "NcString"},
+			{WorkerTypeBattery, "Battery", "TX_BATT_MINS", []int{1, 2, 1, 16}, true, "NcString"},
+			{WorkerTypeAudioLevel, "AudioLevel", "AUDIO_LEVEL_RMS", []int{1, 2, 1, 17}, true, "NcString"},
+			{WorkerTypeRSSI, "RSSI", "RSSI", []int{1, 2, 1, 18}, true, "NcString"},
+		}
+	case ModelFamilySLXDPlus:
+		return []ChannelWorkerConfig{
+			{WorkerTypeGain, "Gain", "AUDIO_GAIN", []int{1, 2, 1, 10}, false, "NcFloat32"},
+			{WorkerTypeMute, "Mute", "AUDIO_MUTE", []int{1, 2, 1, 11}, false, "NcBoolean"},
+			{WorkerTypeChannelName, "ChannelName", "CHAN_NAME", []int{1, 2, 1, 12}, false, "NcString"},
+			{WorkerTypeFreq, "Frequency", "FREQUENCY", []int{1, 2, 1, 13}, false, "NcString"},
+			{WorkerTypeGroupChan, "GroupChannel", "GROUP_CHANNEL", []int{1, 2, 1, 14}, false, "NcString"},
+			{WorkerTypeTX, "Transmitter", "LINK_TX_MODEL", []int{1, 2, 1, 15}, true, "NcString"},
+			{WorkerTypeBattery, "Battery", "TX_BATT_MINS", []int{1, 2, 1, 16}, true, "NcString"},
+			{WorkerTypeAudioLevel, "AudioLevel", "AUDIO_LEVEL_RMS", []int{1, 2, 1, 17}, true, "NcString"},
+			{WorkerTypeRSSI, "RSSI", "RSSI", []int{1, 2, 1, 18}, true, "NcString"},
+		}
+	default:
 		return nil
 	}
+}
 
-	workers := make([]*NcWorker, 0, len(params))
+// CreateChannelWorkers creates all workers for a channel based on model family
+// Returns workers and a map of channel_paramKey -> OID for REP message routing
+func CreateChannelWorkers(family ShureModelFamily, channel int, baseOID int, ctrl ShureController) ([]*NcWorker, map[string]int) {
+	configs := ChannelWorkersConfig(family)
+	if configs == nil {
+		return nil, nil
+	}
 
-	for i, param := range params {
+	workers := make([]*NcWorker, 0, len(configs))
+	paramOIDMap := make(map[string]int)
+
+	for i, cfg := range configs {
 		oid := baseOID + i
-		worker := NewNcWorker(oid, param.ClassID, nil, param.Name, fmt.Sprintf("Channel %d %s", channel, param.Name))
+		worker := NewNcWorker(oid, cfg.ClassID, nil, cfg.Name, fmt.Sprintf("Ch%d %s", channel, cfg.Name))
 
-		if !param.IsReadOnly {
-			paramName := param.Name
+		if !cfg.IsReadOnly {
+			paramName := cfg.ShureParam
 			channelNum := channel
 			worker.OnSet = func(val interface{}) error {
 				cmd := fmt.Sprintf("< SET %d %s %v >\n", channelNum, paramName, val)
@@ -193,8 +237,150 @@ func CreateWorkersForChannel(family ShureModelFamily, channel int, baseOID int, 
 			}
 		}
 
+		paramKey := fmt.Sprintf("%d_%s", channel, cfg.ShureParam)
+		paramOIDMap[paramKey] = oid
+
 		workers = append(workers, worker)
 	}
 
-	return workers
+	return workers, paramOIDMap
+}
+
+// DeviceWorkerConfig defines a single parameter worker for the device (not channel-specific)
+type DeviceWorkerConfig struct {
+	WorkerType  WorkerType
+	Name        string
+	ShureParam  string
+	ClassID     []int
+	IsReadOnly  bool
+	TypeName    string
+	NeedsChannel bool // Some device params still need channel number (e.g., CHAN_NAME for QLX-D)
+}
+
+// DeviceWorkersConfig returns the list of device-level workers for a model family
+func DeviceWorkersConfig(family ShureModelFamily) []DeviceWorkerConfig {
+	switch family {
+	case ModelFamilyQLXD:
+		return []DeviceWorkerConfig{
+			{WorkerTypeFWVer, "FwVersion", "FW_VER", []int{1, 2, 1, 19}, true, "NcString", false},
+			{WorkerTypeDeviceID, "DeviceID", "DEVICE_ID", []int{1, 2, 1, 20}, false, "NcString", false},
+			{WorkerTypeEncryption, "Encryption", "ENCRYPTION", []int{1, 2, 1, 21}, false, "NcBoolean", false},
+			{WorkerTypeMACAddr, "MacAddress", "MAC_ADDR", []int{1, 2, 1, 22}, true, "NcString", false},
+		}
+	default:
+		return nil
+	}
+}
+
+// CreateDeviceWorkers creates all device-level workers for QLX-D
+func CreateDeviceWorkers(family ShureModelFamily, baseOID int, ctrl ShureController) ([]*NcWorker, map[string]int) {
+	configs := DeviceWorkersConfig(family)
+	if configs == nil {
+		return nil, nil
+	}
+
+	workers := make([]*NcWorker, 0, len(configs))
+	paramOIDMap := make(map[string]int)
+
+	for i, cfg := range configs {
+		oid := baseOID + i
+		worker := NewNcWorker(oid, cfg.ClassID, nil, cfg.Name, cfg.Name)
+
+		if !cfg.IsReadOnly {
+			paramName := cfg.ShureParam
+			worker.OnSet = func(val interface{}) error {
+				cmd := fmt.Sprintf("< SET %s %v >\n", paramName, val)
+				return ctrl.SendCommand(cmd)
+			}
+		}
+
+		paramOIDMap[cfg.ShureParam] = oid
+		workers = append(workers, worker)
+	}
+
+	return workers, paramOIDMap
+}
+
+// SubWorkerConfig defines a worker within a nested block (Battery, TX, etc.)
+type SubWorkerConfig struct {
+	WorkerType WorkerType
+	Name       string
+	ShureParam string
+	ClassID    []int
+	IsReadOnly bool
+	TypeName   string
+}
+
+// ChannelSubWorkersConfig returns the nested block workers for a channel
+func ChannelSubWorkersConfig(family ShureModelFamily) map[string][]SubWorkerConfig {
+	switch family {
+	case ModelFamilyQLXD:
+		return map[string][]SubWorkerConfig{
+			"AudioGain": {
+				{WorkerTypeGain, "SetAudioGain", "AUDIO_GAIN", []int{1, 2, 1, 10}, false, "NcFloat32"},
+			},
+			"Battery": {
+				{WorkerTypeBattCycle, "BattCycle", "BATT_CYCLE", []int{1, 2, 1, 23}, true, "NcString"},
+				{WorkerTypeBattRunTime, "BattRunTime", "BATT_RUN_TIME", []int{1, 2, 1, 24}, true, "NcString"},
+				{WorkerTypeBattTempF, "BattTempF", "BATT_TEMP_F", []int{1, 2, 1, 25}, true, "NcString"},
+				{WorkerTypeBattTempC, "BattTempC", "BATT_TEMP_C", []int{1, 2, 1, 26}, true, "NcString"},
+				{WorkerTypeBattType, "BattType", "BATT_TYPE", []int{1, 2, 1, 27}, true, "NcString"},
+				{WorkerTypeBattCharge, "BattCharge", "BATT_CHARGE", []int{1, 2, 1, 28}, true, "NcString"},
+				{WorkerTypeBattHealth, "BattHealth", "BATT_HEALTH", []int{1, 2, 1, 29}, true, "NcString"},
+				{WorkerTypeBattBars, "BattBars", "BATT_BARS", []int{1, 2, 1, 30}, true, "NcString"},
+			},
+			"Transmitter": {
+				{WorkerTypeTxType, "TxType", "TX_TYPE", []int{1, 2, 1, 31}, true, "NcString"},
+				{WorkerTypeTxOffset, "TxOffset", "TX_OFFSET", []int{1, 2, 1, 32}, true, "NcString"},
+				{WorkerTypeTxRFPower, "TxRFPower", "TX_RF_PWR", []int{1, 2, 1, 33}, true, "NcString"},
+				{WorkerTypeTxPwrLock, "TxPwrLock", "TX_PWR_LOCK", []int{1, 2, 1, 34}, true, "NcString"},
+				{WorkerTypeTxMenuLock, "TxMenuLock", "TX_MENU_LOCK", []int{1, 2, 1, 35}, true, "NcString"},
+				{WorkerTypeTxDeviceID, "TxDeviceID", "TX_DEVICE_ID", []int{1, 2, 1, 36}, true, "NcString"},
+				{WorkerTypeTxMuteStatus, "TxMuteStatus", "TX_MUTE_STATUS", []int{1, 2, 1, 37}, true, "NcString"},
+				{WorkerTypeTxMuteButtonStatus, "TxMuteButtonStatus", "TX_MUTE_BUTTON_STATUS", []int{1, 2, 1, 38}, true, "NcString"},
+				{WorkerTypeTxPowerSource, "TxPowerSource", "TX_POWER_SOURCE", []int{1, 2, 1, 39}, true, "NcString"},
+			},
+		}
+	default:
+		return nil
+	}
+}
+
+// CreateChannelSubWorkers creates sub-block workers for a channel
+func CreateChannelSubWorkers(family ShureModelFamily, channel int, baseOID int, ctrl ShureController) (map[string][]*NcWorker, map[string]map[string]int) {
+	subConfigs := ChannelSubWorkersConfig(family)
+	if subConfigs == nil {
+		return nil, nil
+	}
+
+	resultWorkers := make(map[string][]*NcWorker)
+	resultParamMap := make(map[string]map[string]int)
+
+	for blockName, configs := range subConfigs {
+		workers := make([]*NcWorker, 0, len(configs))
+		paramMap := make(map[string]int)
+
+		for i, cfg := range configs {
+			oid := baseOID + i
+			worker := NewNcWorker(oid, cfg.ClassID, nil, cfg.Name, fmt.Sprintf("Ch%d %s %s", channel, blockName, cfg.Name))
+
+			if !cfg.IsReadOnly {
+				paramName := cfg.ShureParam
+				channelNum := channel
+				worker.OnSet = func(val interface{}) error {
+					cmd := fmt.Sprintf("< SET %d %s %v >\n", channelNum, paramName, val)
+					return ctrl.SendCommand(cmd)
+				}
+			}
+
+			paramMap[cfg.ShureParam] = oid
+
+			workers = append(workers, worker)
+		}
+
+		resultWorkers[blockName] = workers
+		resultParamMap[blockName] = paramMap
+	}
+
+	return resultWorkers, resultParamMap
 }

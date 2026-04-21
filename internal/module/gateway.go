@@ -177,6 +177,9 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 	family := infrastructure.DetectModelFamily(dev.Instance)
 	slog.Info("Model family from discovery", "address", addr, "instance", dev.Instance, "family", family)
 
+	// Compute maxChannels early for NCP setup
+	maxChannels := infrastructure.MaxChannelsFromModel(dev.Instance)
+
 	g.shureCtrls[addr] = &shureDeviceInfo{
 		ctrl:           ctrl,
 		lastSeen:       time.Now(),
@@ -193,13 +196,16 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 	}
 	slog.Info("Connected to Shure device", "address", addr)
 
+	// Setup NCP hierarchy BEFORE sending discovery commands
+	// This ensures parameterOIDs map is populated before REP responses arrive
+	info := g.shureCtrls[addr]
+	g.setupDeviceNCP(addr, dev, deviceOID, family, maxChannels, ctrl, info)
+
 	// Start event listener for this controller
 	go g.listenToShureEvents(ctx, addr, ctrl.ReceiveEvents())
 
 	// On connection, we send GET x ALL for each channel and SET x METER_RATE
 	// Model family is already set from discovery (mDNS broadcast contains model name)
-	// Use actual channel count based on model variant (e.g. AD4Q=4, AD4D=2)
-	maxChannels := infrastructure.MaxChannelsFromModel(dev.Instance)
 
 	// For multi-channel receivers (Axient Digital, ULXD4D, ULXD4Q), GET 0 ALL is efficient
 	// Per Shure spec, channel "0" means "all channels"
@@ -270,12 +276,16 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		g.shureCtrls[addr].flowIDs[i] = make(map[string]string)
 		g.shureCtrls[addr].senderIDs[i] = make(map[string]string)
 	}
+}
 
+// setupDeviceNCP sets up the NCP hierarchy for a device
+	// This must be called BEFORE sending discovery commands to ensure parameterOIDs map is populated
+func (g *gatewayImpl) setupDeviceNCP(addr string, dev infrastructure.DiscoveredDevice, deviceOID int, family infrastructure.ShureModelFamily, maxChannels int, ctrl infrastructure.ShureController, info *shureDeviceInfo) {
 	// IS-12 NCP Setup
-	// Register custom classes if they are not already registered
+	// Register custom classes matching the class IDs used by CreateChannelWorkers
 	g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
 		Name:    "GainWorker",
-		ClassID: []int{1, 2, 1, 1},
+		ClassID: []int{1, 2, 1, 10},
 		Properties: []infrastructure.NcPropertyDescriptor{
 			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
 			{Name: "gain", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcFloat32"},
@@ -283,33 +293,388 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 	})
 	g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
 		Name:    "MuteWorker",
-		ClassID: []int{1, 2, 1, 2},
+		ClassID: []int{1, 2, 1, 11},
 		Properties: []infrastructure.NcPropertyDescriptor{
 			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
 			{Name: "mute", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcBoolean"},
 		},
 	})
+	g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+		Name:    "ChannelNameWorker",
+		ClassID: []int{1, 2, 1, 12},
+		Properties: []infrastructure.NcPropertyDescriptor{
+			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+			{Name: "channelName", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString"},
+		},
+	})
+	g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+		Name:    "FrequencyWorker",
+		ClassID: []int{1, 2, 1, 13},
+		Properties: []infrastructure.NcPropertyDescriptor{
+			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+			{Name: "frequency", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString"},
+		},
+	})
+	g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+		Name:    "GroupChannelWorker",
+		ClassID: []int{1, 2, 1, 14},
+		Properties: []infrastructure.NcPropertyDescriptor{
+			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+			{Name: "groupChannel", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString"},
+		},
+	})
+	g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+		Name:    "TransmitterWorker",
+		ClassID: []int{1, 2, 1, 15},
+		Properties: []infrastructure.NcPropertyDescriptor{
+			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+			{Name: "transmitter", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString"},
+		},
+	})
+	g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+		Name:    "BatteryWorker",
+		ClassID: []int{1, 2, 1, 16},
+		Properties: []infrastructure.NcPropertyDescriptor{
+			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+			{Name: "battery", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString"},
+		},
+	})
+	g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+		Name:    "AudioLevelWorker",
+		ClassID: []int{1, 2, 1, 17},
+		Properties: []infrastructure.NcPropertyDescriptor{
+			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+			{Name: "audioLevel", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString"},
+		},
+	})
+	g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+		Name:    "RSSIWorker",
+		ClassID: []int{1, 2, 1, 18},
+		Properties: []infrastructure.NcPropertyDescriptor{
+			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+			{Name: "rssi", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString"},
+		},
+	})
+
+	// QLX-D specific classes for device-level workers
+	if family == infrastructure.ModelFamilyQLXD {
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "FwVerWorker",
+			ClassID: []int{1, 2, 1, 19},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "fwVer", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "DeviceIDWorker",
+			ClassID: []int{1, 2, 1, 20},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "deviceID", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString"},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "EncryptionWorker",
+			ClassID: []int{1, 2, 1, 21},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "encryption", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcBoolean"},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "MacAddrWorker",
+			ClassID: []int{1, 2, 1, 22},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "macAddr", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "BattCycleWorker",
+			ClassID: []int{1, 2, 1, 23},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "battCycle", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "BattRunTimeWorker",
+			ClassID: []int{1, 2, 1, 24},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "battRunTime", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "BattTempFWorker",
+			ClassID: []int{1, 2, 1, 25},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "battTempF", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "BattTempCWorker",
+			ClassID: []int{1, 2, 1, 26},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "battTempC", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "BattTypeWorker",
+			ClassID: []int{1, 2, 1, 27},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "battType", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "BattChargeWorker",
+			ClassID: []int{1, 2, 1, 28},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "battCharge", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "BattHealthWorker",
+			ClassID: []int{1, 2, 1, 29},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "battHealth", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "BattBarsWorker",
+			ClassID: []int{1, 2, 1, 30},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "battBars", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "TxTypeWorker",
+			ClassID: []int{1, 2, 1, 31},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "txType", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "TxOffsetWorker",
+			ClassID: []int{1, 2, 1, 32},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "txOffset", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "TxRFPowerWorker",
+			ClassID: []int{1, 2, 1, 33},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "txRFPower", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "TxPwrLockWorker",
+			ClassID: []int{1, 2, 1, 34},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "txPwrLock", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "TxMenuLockWorker",
+			ClassID: []int{1, 2, 1, 35},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "txMenuLock", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "TxDeviceIDWorker",
+			ClassID: []int{1, 2, 1, 36},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "txDeviceID", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "TxMuteStatusWorker",
+			ClassID: []int{1, 2, 1, 37},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "txMuteStatus", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "TxMuteButtonStatusWorker",
+			ClassID: []int{1, 2, 1, 38},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "txMuteButtonStatus", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "TxPowerSourceWorker",
+			ClassID: []int{1, 2, 1, 39},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "txPowerSource", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "EncryptionWarningWorker",
+			ClassID: []int{1, 2, 1, 40},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "encryptionWarning", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "AntennaStatusWorker",
+			ClassID: []int{1, 2, 1, 41},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "antennaStatus", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "RFLevelWorker",
+			ClassID: []int{1, 2, 1, 42},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "rfLevel", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
+			Name:    "AudioLevelMeterWorker",
+			ClassID: []int{1, 2, 1, 43},
+			Properties: []infrastructure.NcPropertyDescriptor{
+				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
+				{Name: "audioLevel", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
+			},
+		})
+	}
 
 	// Use a simple OID allocation (In a real app, this should be more robust)
 	devBlock := infrastructure.NewNcBlock(deviceOID, nil, "Device", dev.Instance)
 	g.nmosCtrl.RegisterNCPObject(deviceOID, devBlock)
 
-	// Create channel blocks under the device block
-	// Each channel gets its own block with workers for that channel's parameters
-	info := g.shureCtrls[addr]
-	for ch := 1; ch <= maxChannels; ch++ {
-		channelOID := deviceOID + ch
-		info.channelOIDs[ch] = channelOID
-		channelBlock := infrastructure.NewNcBlock(channelOID, nil, fmt.Sprintf("Channel%d", ch), fmt.Sprintf("Channel %d", ch))
-		g.nmosCtrl.RegisterNCPObject(channelOID, channelBlock)
-		devBlock.AddItem(channelOID)
-
-		// Pre-create workers for all known parameters for this channel
-		baseOID := channelOID * 100
-		workers := infrastructure.CreateWorkersForChannel(family, ch, baseOID, ctrl)
-		for _, worker := range workers {
+	// QLX-D has a different hierarchy structure
+	if family == infrastructure.ModelFamilyQLXD {
+		// Create device-level workers (FW_VER, DEVICE_ID, ENCRYPTION, MAC_ADDR)
+		baseDeviceOID := deviceOID * 100
+		deviceWorkers, deviceParamOIDMap := infrastructure.CreateDeviceWorkers(family, baseDeviceOID, ctrl)
+		for paramKey, oid := range deviceParamOIDMap {
+			info.parameterOIDs[paramKey] = oid
+		}
+		for _, worker := range deviceWorkers {
 			g.nmosCtrl.RegisterNCPObject(worker.GetOID(), worker)
-			channelBlock.AddItem(worker.GetOID())
+			devBlock.AddItem(worker.GetOID())
+		}
+
+		// Create channel blocks under the device block
+		for ch := 1; ch <= maxChannels; ch++ {
+			channelOID := deviceOID + ch
+			info.channelOIDs[ch] = channelOID
+			channelBlock := infrastructure.NewNcBlock(channelOID, nil, fmt.Sprintf("Channel%d", ch), fmt.Sprintf("Channel %d", ch))
+			g.nmosCtrl.RegisterNCPObject(channelOID, channelBlock)
+			devBlock.AddItem(channelOID)
+
+			// Create channel-level workers (CHAN_NAME, FREQUENCY, GROUP_CHAN, ENCRYPTION_WARNING)
+			baseOID := channelOID * 100
+			workers, paramOIDMap := infrastructure.CreateChannelWorkers(family, ch, baseOID, ctrl)
+			for paramKey, oid := range paramOIDMap {
+				info.parameterOIDs[paramKey] = oid
+			}
+			for _, worker := range workers {
+				g.nmosCtrl.RegisterNCPObject(worker.GetOID(), worker)
+				channelBlock.AddItem(worker.GetOID())
+			}
+
+			// Create nested sub-blocks: AudioGain, Battery, TX
+			subBlockBase := channelOID * 1000
+
+			// AudioGain block with SetAudioGain, INC_AUDIO_GAIN, DEC_AUDIO_GAIN
+			audioGainBlock := infrastructure.NewNcBlock(subBlockBase+1, nil, "AudioGain", fmt.Sprintf("Ch%d AudioGain", ch))
+			g.nmosCtrl.RegisterNCPObject(audioGainBlock.GetOID(), audioGainBlock)
+			channelBlock.AddItem(audioGainBlock.GetOID())
+
+			setAudioGainWorker := infrastructure.NewNcWorker(subBlockBase+10, []int{1, 2, 1, 10}, nil, "SetAudioGain", fmt.Sprintf("Ch%d SetAudioGain", ch))
+			setAudioGainWorker.OnSet = func(val interface{}) error {
+				cmd := fmt.Sprintf("< SET %d AUDIO_GAIN %v >\n", ch, val)
+				return ctrl.SendCommand(cmd)
+			}
+			g.nmosCtrl.RegisterNCPObject(setAudioGainWorker.GetOID(), setAudioGainWorker)
+			audioGainBlock.AddItem(setAudioGainWorker.GetOID())
+			info.parameterOIDs[fmt.Sprintf("%d_%s", ch, "AUDIO_GAIN")] = setAudioGainWorker.GetOID()
+
+			incAudioGainWorker := infrastructure.NewNcWorker(subBlockBase+11, []int{1, 2, 1, 10}, nil, "IncAudioGain", fmt.Sprintf("Ch%d IncAudioGain", ch))
+			incAudioGainWorker.OnSet = func(val interface{}) error {
+				cmd := fmt.Sprintf("< SET %d AUDIO_GAIN INC %v >\n", ch, val)
+				return ctrl.SendCommand(cmd)
+			}
+			g.nmosCtrl.RegisterNCPObject(incAudioGainWorker.GetOID(), incAudioGainWorker)
+			audioGainBlock.AddItem(incAudioGainWorker.GetOID())
+
+			decAudioGainWorker := infrastructure.NewNcWorker(subBlockBase+12, []int{1, 2, 1, 10}, nil, "DecAudioGain", fmt.Sprintf("Ch%d DecAudioGain", ch))
+			decAudioGainWorker.OnSet = func(val interface{}) error {
+				cmd := fmt.Sprintf("< SET %d AUDIO_GAIN DEC %v >\n", ch, val)
+				return ctrl.SendCommand(cmd)
+			}
+			g.nmosCtrl.RegisterNCPObject(decAudioGainWorker.GetOID(), decAudioGainWorker)
+			audioGainBlock.AddItem(decAudioGainWorker.GetOID())
+
+			// Battery block
+			batteryBlock := infrastructure.NewNcBlock(subBlockBase+2, nil, "Battery", fmt.Sprintf("Ch%d Battery", ch))
+			g.nmosCtrl.RegisterNCPObject(batteryBlock.GetOID(), batteryBlock)
+			channelBlock.AddItem(batteryBlock.GetOID())
+
+			batteryWorkers, batteryParamMap := infrastructure.CreateChannelSubWorkers(family, ch, subBlockBase+20, ctrl)
+			for _, workers := range batteryWorkers["Battery"] {
+				g.nmosCtrl.RegisterNCPObject(workers.GetOID(), workers)
+				batteryBlock.AddItem(workers.GetOID())
+			}
+			for param, oid := range batteryParamMap["Battery"] {
+				info.parameterOIDs[fmt.Sprintf("%d_%s", ch, param)] = oid
+			}
+
+			// TX block
+			txBlock := infrastructure.NewNcBlock(subBlockBase+3, nil, "Transmitter", fmt.Sprintf("Ch%d Transmitter", ch))
+			g.nmosCtrl.RegisterNCPObject(txBlock.GetOID(), txBlock)
+			channelBlock.AddItem(txBlock.GetOID())
+
+			txWorkers, txParamMap := infrastructure.CreateChannelSubWorkers(family, ch, subBlockBase+30, ctrl)
+			for _, workers := range txWorkers["Transmitter"] {
+				g.nmosCtrl.RegisterNCPObject(workers.GetOID(), workers)
+				txBlock.AddItem(workers.GetOID())
+			}
+			for param, oid := range txParamMap["Transmitter"] {
+				info.parameterOIDs[fmt.Sprintf("%d_%s", ch, param)] = oid
+			}
+		}
+	} else {
+		// Original behavior for other model families
+		for ch := 1; ch <= maxChannels; ch++ {
+			channelOID := deviceOID + ch
+			info.channelOIDs[ch] = channelOID
+			channelBlock := infrastructure.NewNcBlock(channelOID, nil, fmt.Sprintf("Channel%d", ch), fmt.Sprintf("Channel %d", ch))
+			g.nmosCtrl.RegisterNCPObject(channelOID, channelBlock)
+			devBlock.AddItem(channelOID)
+
+			baseOID := channelOID * 100
+			workers, paramOIDMap := infrastructure.CreateChannelWorkers(family, ch, baseOID, ctrl)
+			for paramKey, oid := range paramOIDMap {
+				info.parameterOIDs[paramKey] = oid
+			}
+			for _, worker := range workers {
+				g.nmosCtrl.RegisterNCPObject(worker.GetOID(), worker)
+				channelBlock.AddItem(worker.GetOID())
+			}
 		}
 	}
 
@@ -321,7 +686,7 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 	}
 }
 
-// listenToShureEvents listens for events from a specific Shure controller
+	// listenToShureEvents listens for events from a specific Shure controller
 func (g *gatewayImpl) listenToShureEvents(ctx context.Context, addr string, events <-chan interface{}) {
 	slog.Info("listenToShureEvents started", "address", addr)
 	defer slog.Info("listenToShureEvents exiting", "address", addr)
@@ -696,70 +1061,71 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 		if sID, ok := info.sourceIDs[report.Channel][report.Param]; ok {
 			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel][report.Param], getNMOSEventType(report.Param), report.Value)
 		}
-	}
 
-	// IS-12 NCP Parameter Updates
-	// REP messages should go to NCP (including metered params for control)
-	if report.Type == "REP" && report.Param != "ALL" {
+		// Also update the NCP worker for this metered param
 		paramKey := fmt.Sprintf("%d_%s", report.Channel, report.Param)
 		g.mu.Lock()
 		oid, exists := info.parameterOIDs[paramKey]
-
-		// Decide if we should create a worker for this parameter
-		// We avoid purely informational or transient parameters
-		shouldCreateWorker := !exists &&
-			report.Param != "METER_RATE" &&
-			report.Param != "SAMPLE" &&
-			report.Param != "FLASH" &&
-			report.Param != "FW_VER" &&
-			report.Param != "MODEL" &&
-			report.Param != "DEVICE_ID" &&
-			report.Param != "SERIAL_NUMBER"
-
-		if shouldCreateWorker {
-			// Allocate a new OID for this parameter
-			// 1000 + (deviceIndex * 100) + (parameterCount)
-			// This ensures unique OIDs across devices
-			oid = 1000 + (info.deviceIndex * 100) + len(info.parameterOIDs)
-			info.parameterOIDs[paramKey] = oid
-
-			// Create Worker based on parameter type
-			var classID []int
-			switch report.Param {
-			case "AUDIO_GAIN":
-				classID = []int{1, 2, 1, 1} // Gain Worker
-			case "AUDIO_MUTE", "MUTE":
-				classID = []int{1, 2, 1, 2} // Mute Worker
-			default:
-				classID = []int{1, 2} // Generic Worker
-			}
-
-			worker := infrastructure.NewNcWorker(oid, classID, nil, report.Param, fmt.Sprintf("%s Channel %d", report.Param, report.Channel))
-			worker.Value = report.Value
-
-			// Set callback to send command back to Shure
-			paramToSet := report.Param
-			worker.OnSet = func(val interface{}) error {
-				cmd := fmt.Sprintf("< SET %d %s %v >\n", report.Channel, paramToSet, val)
-				return info.ctrl.SendCommand(cmd)
-			}
-
-			g.nmosCtrl.RegisterNCPObject(oid, worker)
-
-			// Add to Device Block
-			if devObj := g.nmosCtrl.GetNCPObject(info.deviceOID); devObj != nil {
-				if db, ok := devObj.(*infrastructure.NcBlock); ok {
-					db.AddItem(oid)
-				}
-			}
-		}
 		g.mu.Unlock()
-
-		// Update existing worker value
 		if exists {
 			if obj := g.nmosCtrl.GetNCPObject(oid); obj != nil {
 				if worker, ok := obj.(*infrastructure.NcWorker); ok {
-					// Use Level 3, Index 1 for the main value of the worker
+					worker.SetProperty(infrastructure.NCPPropertyID{Level: 3, Index: 1}, report.Value)
+				}
+			}
+		}
+	}
+
+	// SAMPLE ALL messages also update metered worker values
+	if report.Type == "SAMPLE" && report.Param == "ALL" {
+		g.updateMeteredWorkersFromSample(info, report)
+	}
+
+	// IS-12 NCP Parameter Updates
+	// REP messages update existing workers that were pre-created via CreateChannelWorkers
+	// Dynamic worker creation is disabled - all workers are pre-created based on model family
+	if report.Type == "REP" && report.Param != "ALL" {
+		paramKey := fmt.Sprintf("%d_%s", report.Channel, report.Param)
+		normalizedParam := strings.ReplaceAll(report.Param, " ", "")
+
+		g.mu.Lock()
+		oid, exists := info.parameterOIDs[paramKey]
+		g.mu.Unlock()
+
+		// Also try normalized param key (with spaces removed) for QLXD compatibility
+		if !exists {
+			paramKey = fmt.Sprintf("%d_%s", report.Channel, normalizedParam)
+			g.mu.Lock()
+			oid, exists = info.parameterOIDs[paramKey]
+			g.mu.Unlock()
+		}
+
+		// For QLX-D, also try device-level param lookup (no channel prefix)
+		// Device-level params: FW_VER, DEVICE_ID, ENCRYPTION, MAC_ADDR
+		if !exists && info.modelFamily == infrastructure.ModelFamilyQLXD {
+			g.mu.Lock()
+			oid, exists = info.parameterOIDs[report.Param]
+			g.mu.Unlock()
+			if !exists {
+				// Try normalized without channel
+				g.mu.Lock()
+				oid, exists = info.parameterOIDs[normalizedParam]
+				g.mu.Unlock()
+			}
+		}
+
+		if !exists {
+			slog.Debug("REP param not found in parameterOIDs",
+				"channel", report.Channel,
+				"param", report.Param,
+				"deviceOID", info.deviceOID,
+				"family", info.modelFamily)
+		}
+
+		// Update existing worker value only (no dynamic worker creation)
+		if exists {
+			if obj := g.nmosCtrl.GetNCPObject(oid); obj != nil {
+				if worker, ok := obj.(*infrastructure.NcWorker); ok {
 					worker.SetProperty(infrastructure.NCPPropertyID{Level: 3, Index: 1}, report.Value)
 				}
 			}
@@ -1023,6 +1389,50 @@ func (g *gatewayImpl) handleSLDXSampleEvents(info *shureDeviceInfo, channel int,
 	g.ensureIS07Resources(info, channel, "RF_RSSI", deviceID, deviceInstance)
 	if sID, ok := info.sourceIDs[channel]["RF_RSSI"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_RSSI"], "number", sample.RFRSSIDBM())
+	}
+}
+
+// updateMeteredWorkersFromSample updates NCP worker values from SAMPLE data
+func (g *gatewayImpl) updateMeteredWorkersFromSample(info *shureDeviceInfo, report *infrastructure.TPCIReport) {
+	switch info.modelFamily {
+	case infrastructure.ModelFamilyAxientDigital:
+		if sample := infrastructure.ParseSampleReport(report.Raw); sample != nil {
+			channel := report.Channel
+			g.updateWorkerValue(info, channel, "AUDIO_LEVEL_PEAK", sample.AudioLevelPeakDBFS())
+			g.updateWorkerValue(info, channel, "AUDIO_LEVEL_RMS", sample.AudioLevelRMSDBFS())
+			g.updateWorkerValue(info, channel, "RF_RSSI_A", sample.RFRSSI_A_DBM())
+			g.updateWorkerValue(info, channel, "RF_RSSI_B", sample.RFRSSI_B_DBM())
+		}
+	case infrastructure.ModelFamilyULXD, infrastructure.ModelFamilyQLXD:
+		if sample := infrastructure.ParseULXDSampleReport(report.Raw); sample != nil {
+			channel := report.Channel
+			g.updateWorkerValue(info, channel, "ANT_STATUS", string(sample.AntStatus))
+			g.updateWorkerValue(info, channel, "RF_LEVEL", sample.RFLevelDBM())
+			g.updateWorkerValue(info, channel, "AUDIO_LEVEL", sample.AudioLevelDBFS())
+		}
+	case infrastructure.ModelFamilySLXD, infrastructure.ModelFamilySLXDPlus:
+		if sample := infrastructure.ParseSLDXSampleReport(report.Raw); sample != nil {
+			channel := report.Channel
+			g.updateWorkerValue(info, channel, "AUDIO_LEVEL_PEAK", sample.AudioPeakDBFS())
+			g.updateWorkerValue(info, channel, "AUDIO_LEVEL_RMS", sample.AudioRMSDBFS())
+			g.updateWorkerValue(info, channel, "RF_RSSI", sample.RFRSSIDBM())
+		}
+	}
+}
+
+// updateWorkerValue updates a worker's value if it exists
+func (g *gatewayImpl) updateWorkerValue(info *shureDeviceInfo, channel int, param string, value interface{}) {
+	paramKey := fmt.Sprintf("%d_%s", channel, param)
+	g.mu.Lock()
+	oid, exists := info.parameterOIDs[paramKey]
+	g.mu.Unlock()
+	if !exists {
+		return
+	}
+	if obj := g.nmosCtrl.GetNCPObject(oid); obj != nil {
+		if worker, ok := obj.(*infrastructure.NcWorker); ok {
+			worker.SetProperty(infrastructure.NCPPropertyID{Level: 3, Index: 1}, value)
+		}
 	}
 }
 

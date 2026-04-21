@@ -431,11 +431,11 @@ func IsMeteredParam(param string) bool {
 	// Normalize spaces to underscores for QLX-D/ULX-D compatibility
 	normalized := strings.ReplaceAll(param, " ", "_")
 	switch normalized {
-	case "CHAN_QUALITY", "AUDIO_LED_BITMAP", "AUDIO_LEVEL_PEAK", "AUDIO_LEVEL_RMS",
+	case "CHAN_QUALITY", "AUDIO_LED_BITMAP", "AUDIO_LEVEL_PEAK", "AUDIO_LEVEL_RMS", "AUDIO_LEVEL",
 		"ANTENNA_STATUS", "RF_LED_BITMAP_A", "RF_RSSI_A", "RF_LED_BITMAP_B", "RF_RSSI_B",
 		"RF_LED_BITMAP_C", "RF_RSSI_C", "RF_LED_BITMAP_D", "RF_RSSI_D",
 		"RF_LED_BITMAP_F1", "RF_RSSI_F1", "RF_LED_BITMAP_F2", "RF_RSSI_F2",
-		"AUDIO_SUMMING", "RF_LEVEL", "AUDIO_PEAK", "AUDIO_RMS", "RF_RSSI",
+		"AUDIO_SUMMING", "RF_LEVEL", "RF_RSSI", "AUDIO_PEAK", "AUDIO_RMS",
 		"TX_BATT_BARS", "TX_BATT_CHARGE_PERCENT", "TX_BATT_MINS", "TX_BATT_TEMP_C",
 		"TX_BATT_CYCLE_COUNT", "TX_BATT_HEALTH_PERCENT":
 		return true
