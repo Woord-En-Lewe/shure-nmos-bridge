@@ -304,8 +304,8 @@ func (g *gatewayImpl) listenToShureEvents(ctx context.Context, addr string, even
 				return
 			}
 			if report, ok := ev.(*infrastructure.TPCIReport); ok {
-				// Log ALL responses for discovery debugging
-				slog.Info("Shure REP Received", "address", addr, "type", report.Type, "channel", report.Channel, "param", report.Param, "value", report.Value)
+				// Log SAMPLE responses at Debug level to reduce log spam during normal operation
+				slog.Debug("Shure REP Received", "address", addr, "type", report.Type, "channel", report.Channel, "param", report.Param, "value", report.Value)
 
 				// Forward to message bus for NMOS translation
 				slog.Debug("listenToShureEvents sending to messageBus", "address", addr, "param", report.Param)
