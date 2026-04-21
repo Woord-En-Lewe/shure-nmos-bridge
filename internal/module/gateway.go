@@ -29,6 +29,7 @@ type shureDeviceInfo struct {
 	deviceOID      int                             // OID of the device block in NCP tree
 	deviceInstance string                          // Device instance name (e.g. from mDNS discovery)
 	parameterOIDs  map[string]int                  // param_key -> oid (e.g. "1_AUDIO_GAIN" -> 101)
+	channelOIDs    map[int]int                     // channel -> OID of channel block
 	sourceIDs      map[int]map[string]string       // channel -> param -> sourceID
 	flowIDs        map[int]map[string]string       // channel -> param -> flowID
 	senderIDs      map[int]map[string]string       // channel -> param -> senderID
@@ -185,6 +186,7 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		deviceOID:      deviceOID,
 		deviceInstance: dev.Instance,
 		parameterOIDs:  make(map[string]int),
+		channelOIDs:    make(map[int]int),
 		sourceIDs:      make(map[int]map[string]string),
 		flowIDs:        make(map[int]map[string]string),
 		senderIDs:      make(map[int]map[string]string),
@@ -291,6 +293,25 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 	// Use a simple OID allocation (In a real app, this should be more robust)
 	devBlock := infrastructure.NewNcBlock(deviceOID, nil, "Device", dev.Instance)
 	g.nmosCtrl.RegisterNCPObject(deviceOID, devBlock)
+
+	// Create channel blocks under the device block
+	// Each channel gets its own block with workers for that channel's parameters
+	info := g.shureCtrls[addr]
+	for ch := 1; ch <= maxChannels; ch++ {
+		channelOID := deviceOID + ch
+		info.channelOIDs[ch] = channelOID
+		channelBlock := infrastructure.NewNcBlock(channelOID, nil, fmt.Sprintf("Channel%d", ch), fmt.Sprintf("Channel %d", ch))
+		g.nmosCtrl.RegisterNCPObject(channelOID, channelBlock)
+		devBlock.AddItem(channelOID)
+
+		// Pre-create workers for all known parameters for this channel
+		baseOID := channelOID * 100
+		workers := infrastructure.CreateWorkersForChannel(family, ch, baseOID, ctrl)
+		for _, worker := range workers {
+			g.nmosCtrl.RegisterNCPObject(worker.GetOID(), worker)
+			channelBlock.AddItem(worker.GetOID())
+		}
+	}
 
 	// Add to Root Block (OID 1)
 	if root := g.nmosCtrl.GetNCPObject(1); root != nil {
