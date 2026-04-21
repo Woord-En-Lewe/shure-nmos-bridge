@@ -239,15 +239,15 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		"controls": []interface{}{
 			map[string]interface{}{
 				"type": "urn:x-nmos:control:sr-ctrl/v1.0",
-				"href": fmt.Sprintf("http://%s/x-nmos/connection/v1.1/", g.nmosAddr),
+				"href": fmt.Sprintf("http://%s/x-nmos/connection/v1.1/", g.nmosCtrl.GetListenAddr()),
 			},
 			map[string]interface{}{
 				"type": "urn:x-nmos:control:events/v1.0",
-				"href": fmt.Sprintf("http://%s/x-nmos/events/v1.0/", g.nmosAddr),
+				"href": fmt.Sprintf("http://%s/x-nmos/events/v1.0/", g.nmosCtrl.GetListenAddr()),
 			},
 			map[string]interface{}{
 				"type": "urn:x-nmos:control:ncp/v1.0",
-				"href": fmt.Sprintf("ws://%s/x-nmos/node/v1.3/ncp", g.nmosAddr),
+				"href": fmt.Sprintf("ws://%s/x-nmos/node/v1.3/ncp", g.nmosCtrl.GetListenAddr()),
 			},
 		},
 	})
@@ -490,11 +490,11 @@ func (g *gatewayImpl) ensureIS07Resources(info *shureDeviceInfo, channel int, pa
 		"manifest_href":      nil,
 		"tags": map[string]interface{}{
 			"ext_is_07_source_id":    []string{sourceID},
-			"ext_is_07_rest_api_url": []string{fmt.Sprintf("http://%s/x-nmos/events/v1.0/sources/%s/", g.nmosAddr, sourceID)},
+			"ext_is_07_rest_api_url": []string{fmt.Sprintf("http://%s/x-nmos/events/v1.0/sources/%s/", g.nmosCtrl.GetListenAddr(), sourceID)},
 		},
 		"transport_params": []map[string]interface{}{
 			{
-				"ext_is_07_rest_api_url": fmt.Sprintf("http://%s/x-nmos/events/v1.0/sources/%s/", g.nmosAddr, sourceID),
+				"ext_is_07_rest_api_url": fmt.Sprintf("http://%s/x-nmos/events/v1.0/sources/%s/", g.nmosCtrl.GetListenAddr(), sourceID),
 				"ext_is_07_source_id":    sourceID,
 			},
 		},

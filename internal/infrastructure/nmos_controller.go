@@ -64,6 +64,7 @@ type nmosController struct {
 	httpClient     *http.Client
 	httpServer     *http.Server
 	isRunning      bool
+	listenAddr     string
 	nodes          []interface{}
 	resources      map[string][]interface{}
 	deviceControls map[string][]map[string]interface{}
@@ -647,14 +648,19 @@ func splitHostPort(addr string) (host, port string) {
 func (c *nmosController) startServer() error {
 	r := c.setupRouter()
 
+	listener, err := net.Listen("tcp", c.nodeAddr)
+	if err != nil {
+		return fmt.Errorf("failed to create listener: %w", err)
+	}
+	c.listenAddr = listener.Addr().String()
+
 	c.httpServer = &http.Server{
-		Addr:    c.nodeAddr,
 		Handler: r,
 	}
 
 	go func() {
 		slog.Info("Starting NMOS Node API server", "address", c.nodeAddr)
-		if err := c.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := c.httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("NMOS Node API server error", "error", err)
 		}
 	}()
@@ -1836,6 +1842,14 @@ func (c *nmosController) SubscribeToEvents() <-chan interface{} {
 // GetNodeID returns the node's unique identifier
 func (c *nmosController) GetNodeID() string {
 	return c.nodeID
+}
+
+// GetListenAddr returns the actual address the HTTP server is listening on
+func (c *nmosController) GetListenAddr() string {
+	if c.listenAddr != "" {
+		return c.listenAddr
+	}
+	return c.nodeAddr
 }
 
 // listenForEvents listens for NMOS IS-05 events from the registry
