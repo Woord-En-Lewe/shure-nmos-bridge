@@ -55,6 +55,14 @@ func (c *ncpClient) Close() error {
 	return c.conn.Close()
 }
 
+func (c *ncpClient) SetWriteDeadline(t time.Time) error {
+	return c.conn.SetWriteDeadline(t)
+}
+
+func (c *ncpClient) SetReadDeadline(t time.Time) error {
+	return c.conn.SetReadDeadline(t)
+}
+
 // nmosController is the concrete implementation of NMOSController
 type nmosController struct {
 	registryURL    string
@@ -96,7 +104,7 @@ type nmosController struct {
 	ncpMu              sync.RWMutex
 	ncpClients         map[*ncpClient]bool
 	ncpClientsMu       sync.Mutex
-	ncpSubscriptions   map[int]map[int]NcObject // subscriptionID -> (objectID -> object) for tracking subscriptions
+	ncpSubscriptions   map[*ncpClient]map[int]int // client -> (oid -> subscriptionID)
 	ncpSubMu           sync.RWMutex
 	nextSubscriptionID int
 
@@ -140,7 +148,7 @@ func NewNMOSControllerWithConfig(addr string, registryConfig RegistryDiscoveryCo
 		deviceControls:     make(map[string][]map[string]interface{}),
 		ncpObjects:         make(map[int]NcObject),
 		ncpClients:         make(map[*ncpClient]bool),
-		ncpSubscriptions:   make(map[int]map[int]NcObject),
+		ncpSubscriptions:   make(map[*ncpClient]map[int]int),
 		nextSubscriptionID: 1,
 		eventsChan:         make(chan interface{}, 100),
 		done:               make(chan struct{}),
@@ -164,6 +172,11 @@ func NewNMOSControllerWithConfig(addr string, registryConfig RegistryDiscoveryCo
 	// Register Root Block (OID 1)
 	rootBlock := NewNcBlock(1, nil, "Root", "Root Block")
 	ctrl.RegisterNCPObject(1, rootBlock)
+
+	// Register Device Manager (OID 2)
+	deviceManager := NewNcDeviceManager(2, nil)
+	ctrl.RegisterNCPObject(2, deviceManager)
+	rootBlock.Items = append(rootBlock.Items, 2)
 
 	// Register Class Manager (OID 3)
 	classManager := NewNcClassManager(3, nil)
@@ -957,12 +970,12 @@ func (c *nmosController) handleNCP(w http.ResponseWriter, r *http.Request) {
 			}
 
 		case NCPMessageTypeSubscription:
-			subscribed := c.handleSubscriptions(conn, ncpMsg.Subscriptions)
+			subscribed := c.handleSubscriptions(client, ncpMsg.Subscriptions)
 			respMsg := NCPMessage{
 				MessageType:   NCPMessageTypeSubscriptionResponse,
 				Subscriptions: subscribed,
 			}
-			conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			client.SetWriteDeadline(time.Now().Add(30 * time.Second))
 			if err := client.WriteJSON(respMsg); err != nil {
 				slog.Error("Failed to send NCP subscription response", "error", err)
 				break
@@ -1047,9 +1060,12 @@ func (c *nmosController) dispatchNCPCommand(cmd NCPCommand) NCPCommandResponse {
 }
 
 // handleSubscriptions processes subscription requests from NCP clients
-// Returns list of OIDs that were successfully subscribed (per IS-12 spec)
-func (c *nmosController) handleSubscriptions(conn *websocket.Conn, subscriptionOIDs []int) []int {
+// Returns list of subscription IDs for successfully subscribed OIDs
+func (c *nmosController) handleSubscriptions(conn *ncpClient, subscriptionOIDs []int) []int {
 	var subscribed []int
+
+	c.ncpSubMu.Lock()
+	defer c.ncpSubMu.Unlock()
 
 	for _, oid := range subscriptionOIDs {
 		c.ncpMu.RLock()
@@ -1060,7 +1076,16 @@ func (c *nmosController) handleSubscriptions(conn *websocket.Conn, subscriptionO
 			continue
 		}
 
-		subscribed = append(subscribed, oid)
+		// Create client subscription map if not exists
+		if c.ncpSubscriptions[conn] == nil {
+			c.ncpSubscriptions[conn] = make(map[int]int)
+		}
+
+		// Assign subscription ID
+		subID := c.nextSubscriptionID
+		c.nextSubscriptionID++
+		c.ncpSubscriptions[conn][oid] = subID
+		subscribed = append(subscribed, subID)
 	}
 
 	return subscribed

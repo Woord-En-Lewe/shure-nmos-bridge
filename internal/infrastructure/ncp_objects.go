@@ -258,6 +258,51 @@ func (m *NcClassManager) InvokeMethod(id NCPMethodID, args json.RawMessage) (int
 	return m.ClassManager.InvokeMethod(nca.MethodID(id), args)
 }
 
+// NcDeviceManager wraps nca.DeviceManager to implement the NcObject interface
+type NcDeviceManager struct {
+	*nca.DeviceManager
+}
+
+func NewNcDeviceManager(oid int, owner *int) *NcDeviceManager {
+	return &NcDeviceManager{
+		DeviceManager: nca.NewDeviceManager(oid, owner),
+	}
+}
+
+func (m *NcDeviceManager) GetOID() int {
+	return m.DeviceManager.GetOID()
+}
+
+func (m *NcDeviceManager) GetClassID() []int {
+	return m.DeviceManager.GetClassID()
+}
+
+func (m *NcDeviceManager) GetRole() string {
+	return m.DeviceManager.GetRole()
+}
+
+func (m *NcDeviceManager) GetDescriptor() NcBlockMemberDescriptor {
+	return blockMemberDescriptorToNcBlockMemberDescriptor(m.DeviceManager.GetDescriptor())
+}
+
+func (m *NcDeviceManager) SetNotifyCallback(cb func(oid int, eventID NCPEventID, eventData PropertyChangedEventData)) {
+	m.DeviceManager.SetNotifyCallback(func(oid int, eventID nca.EventID, eventData nca.PropertyChangedData) {
+		cb(oid, NCPEventID(eventID), PropertyChangedEventData(eventData))
+	})
+}
+
+func (m *NcDeviceManager) GetProperty(id NCPPropertyID) (interface{}, error) {
+	return m.DeviceManager.GetProperty(nca.PropertyID(id))
+}
+
+func (m *NcDeviceManager) SetProperty(id NCPPropertyID, value interface{}) error {
+	return m.DeviceManager.SetProperty(nca.PropertyID(id), value)
+}
+
+func (m *NcDeviceManager) InvokeMethod(id NCPMethodID, args json.RawMessage) (interface{}, error) {
+	return m.DeviceManager.InvokeMethod(nca.MethodID(id), args)
+}
+
 // NcWorker wraps nca.Worker to implement the NcObject interface
 type NcWorker struct {
 	*nca.Worker
