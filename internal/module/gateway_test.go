@@ -109,8 +109,8 @@ func TestHandleShureDevice(t *testing.T) {
 			Payload: report,
 		})
 
-		if len(mockNMOS.broadcastEvents) != 13 {
-			t.Errorf("Expected 13 broadcast events (9 pre-registered + 4 lazy registered), got %d", len(mockNMOS.broadcastEvents))
+		if len(mockNMOS.broadcastEvents) != 15 {
+			t.Errorf("Expected 15 broadcast events (9 pre-registered + 6 lazy registered: ANTENNA_A/B/C/D_ACTIVE + CHAN_QUALITY + AUDIO_LED_BITMAP), got %d", len(mockNMOS.broadcastEvents))
 		}
 	})
 

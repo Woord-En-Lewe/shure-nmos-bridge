@@ -1060,6 +1060,38 @@ func (s SampleReport) RFRSSI_F1_DBM() int { return s.RFRSSI_F1 - 120 }
 // RFRSSI_F2_DBM converts RF RSSI F2 to dBm (offset by 120 per Shure spec)
 func (s SampleReport) RFRSSI_F2_DBM() int { return s.RFRSSI_F2 - 120 }
 
+// AntennaAActive returns true if antenna A is active (not 'X')
+func (s SampleReport) AntennaAActive() bool {
+	if len(s.RFAntStatus) < 1 {
+		return false
+	}
+	return s.RFAntStatus[0] != 'X'
+}
+
+// AntennaBActive returns true if antenna B is active (not 'X')
+func (s SampleReport) AntennaBActive() bool {
+	if len(s.RFAntStatus) < 2 {
+		return false
+	}
+	return s.RFAntStatus[1] != 'X'
+}
+
+// AntennaCActive returns true if antenna C is active (not 'X') - quadversity only
+func (s SampleReport) AntennaCActive() bool {
+	if len(s.RFAntStatus) < 3 {
+		return false
+	}
+	return s.RFAntStatus[2] != 'X'
+}
+
+// AntennaDActive returns true if antenna D is active (not 'X') - quadversity only
+func (s SampleReport) AntennaDActive() bool {
+	if len(s.RFAntStatus) < 4 {
+		return false
+	}
+	return s.RFAntStatus[3] != 'X'
+}
+
 // ParseSampleReport parses the Axient Digital SAMPLE string format:
 // < SAMPLE ch ALL qual audBitmap audPeak audRms rfAntStats rfBitmapA rfRssiA rfBitmapB rfRssiB >
 // For Quadversity adds: rfBitmapC rfRssiC rfBitmapD rfRssiD

@@ -599,8 +599,13 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 			}
 		case infrastructure.ModelFamilyULXD, infrastructure.ModelFamilyQLXD:
 			if sample := infrastructure.ParseULXDSampleReport(report.Raw); sample != nil {
-				if sID, ok := info.sourceIDs[report.Channel]["ANTENNA_STATUS"]; ok {
-					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["ANTENNA_STATUS"], "string", string(sample.AntStatus))
+				aActive := sample.AntStatus == infrastructure.AntennaAOn
+				bActive := sample.AntStatus == infrastructure.AntennaBOn
+				if sID, ok := info.sourceIDs[report.Channel]["ANTENNA_A_ACTIVE"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["ANTENNA_A_ACTIVE"], "boolean", aActive)
+				}
+				if sID, ok := info.sourceIDs[report.Channel]["ANTENNA_B_ACTIVE"]; ok {
+					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["ANTENNA_B_ACTIVE"], "boolean", bActive)
 				}
 				if sID, ok := info.sourceIDs[report.Channel]["RF_LEVEL"]; ok {
 					g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel]["RF_LEVEL"], "number", sample.RFLevelDBM())
@@ -774,13 +779,20 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 			}
 
 			if !found {
+				controlType := "number"
+				switch report.Value {
+				case "ON", "OFF":
+					controlType = "boolean"
+				default:
+					if strings.HasPrefix(report.Value, "{") {
+						controlType = "string"
+					}
+				}
+
 				newControl := map[string]interface{}{
 					"name":  report.Param,
-					"type":  "number",
+					"type":  controlType,
 					"value": report.Value,
-				}
-				if report.Param == "AUDIO_MUTE" || report.Param == "MUTE" {
-					newControl["type"] = "boolean"
 				}
 
 				controls = append(controls, newControl)
@@ -840,9 +852,28 @@ func (g *gatewayImpl) handleAxientSampleEvents(info *shureDeviceInfo, channel in
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["AUDIO_LEVEL_RMS"], "number", sample.AudioLevelRMSDBFS())
 	}
 
-	g.ensureIS07Resources(info, channel, "ANTENNA_STATUS", deviceID, deviceInstance)
-	if sID, ok := info.sourceIDs[channel]["ANTENNA_STATUS"]; ok {
-		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["ANTENNA_STATUS"], "string", sample.RFAntStatus)
+	g.ensureIS07Resources(info, channel, "ANTENNA_A_ACTIVE", deviceID, deviceInstance)
+	if sID, ok := info.sourceIDs[channel]["ANTENNA_A_ACTIVE"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["ANTENNA_A_ACTIVE"], "boolean", sample.AntennaAActive())
+	}
+
+	g.ensureIS07Resources(info, channel, "ANTENNA_B_ACTIVE", deviceID, deviceInstance)
+	if sID, ok := info.sourceIDs[channel]["ANTENNA_B_ACTIVE"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["ANTENNA_B_ACTIVE"], "boolean", sample.AntennaBActive())
+	}
+
+	if sample.RFBitmapC > 0 || sample.RFRSSI_C > 0 {
+		g.ensureIS07Resources(info, channel, "ANTENNA_C_ACTIVE", deviceID, deviceInstance)
+		if sID, ok := info.sourceIDs[channel]["ANTENNA_C_ACTIVE"]; ok {
+			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["ANTENNA_C_ACTIVE"], "boolean", sample.AntennaCActive())
+		}
+	}
+
+	if sample.RFBitmapD > 0 || sample.RFRSSI_D > 0 {
+		g.ensureIS07Resources(info, channel, "ANTENNA_D_ACTIVE", deviceID, deviceInstance)
+		if sID, ok := info.sourceIDs[channel]["ANTENNA_D_ACTIVE"]; ok {
+			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["ANTENNA_D_ACTIVE"], "boolean", sample.AntennaDActive())
+		}
 	}
 
 	g.ensureIS07Resources(info, channel, "RF_LED_BITMAP_A", deviceID, deviceInstance)
@@ -909,9 +940,17 @@ func (g *gatewayImpl) handleULXDSampleEvents(info *shureDeviceInfo, channel int,
 	deviceID := info.nmosDeviceIDs[0]
 	deviceInstance := info.deviceInstance
 
-	g.ensureIS07Resources(info, channel, "ANTENNA_STATUS", deviceID, deviceInstance)
-	if sID, ok := info.sourceIDs[channel]["ANTENNA_STATUS"]; ok {
-		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["ANTENNA_STATUS"], "string", string(sample.AntStatus))
+	aActive := sample.AntStatus == infrastructure.AntennaAOn
+	bActive := sample.AntStatus == infrastructure.AntennaBOn
+
+	g.ensureIS07Resources(info, channel, "ANTENNA_A_ACTIVE", deviceID, deviceInstance)
+	if sID, ok := info.sourceIDs[channel]["ANTENNA_A_ACTIVE"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["ANTENNA_A_ACTIVE"], "boolean", aActive)
+	}
+
+	g.ensureIS07Resources(info, channel, "ANTENNA_B_ACTIVE", deviceID, deviceInstance)
+	if sID, ok := info.sourceIDs[channel]["ANTENNA_B_ACTIVE"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["ANTENNA_B_ACTIVE"], "boolean", bActive)
 	}
 
 	g.ensureIS07Resources(info, channel, "RF_LEVEL", deviceID, deviceInstance)
