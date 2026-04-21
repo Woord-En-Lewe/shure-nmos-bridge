@@ -832,7 +832,7 @@ func (c *nmosController) startMDNS() error {
 	return nil
 }
 
-// BroadcastNCPNotification sends a notification to all connected NCP clients
+// BroadcastNCPNotification sends a notification to subscribed NCP clients only
 func (c *nmosController) BroadcastNCPNotification(oid int, eventID NCPEventID, eventData PropertyChangedEventData) {
 	c.ncpClientsMu.Lock()
 	defer c.ncpClientsMu.Unlock()
@@ -849,6 +849,15 @@ func (c *nmosController) BroadcastNCPNotification(oid int, eventID NCPEventID, e
 	}
 
 	for client := range c.ncpClients {
+		// Check if this client is subscribed to this OID
+		c.ncpSubMu.RLock()
+		_, subscribed := c.ncpSubscriptions[client][oid]
+		c.ncpSubMu.RUnlock()
+
+		if !subscribed {
+			continue
+		}
+
 		if err := client.WriteJSON(msg); err != nil {
 			slog.Warn("Failed to send NCP notification to client", "error", err)
 		}
@@ -928,6 +937,9 @@ func (c *nmosController) handleNCP(w http.ResponseWriter, r *http.Request) {
 		c.ncpClientsMu.Lock()
 		delete(c.ncpClients, client)
 		c.ncpClientsMu.Unlock()
+		c.ncpSubMu.Lock()
+		delete(c.ncpSubscriptions, client)
+		c.ncpSubMu.Unlock()
 		conn.Close()
 	}()
 
