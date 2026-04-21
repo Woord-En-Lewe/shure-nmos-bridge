@@ -28,6 +28,7 @@ type NMOSController interface {
 	SubscribeToEvents() <-chan interface{}
 	GetNodeID() string
 	GetListenAddr() string
+	SetAdvertisedAddr(addr string)
 	BroadcastEvent(sourceID string, flowID string, eventType string, data interface{})
 	OnControlChange(callback func(deviceID, controlID string, value interface{}))
 }

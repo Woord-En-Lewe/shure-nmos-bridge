@@ -61,6 +61,7 @@ type nmosController struct {
 	registryConfig RegistryDiscoveryConfig
 	nodeAddr       string
 	nodeID         string
+	advertisedAddr string // externally reachable address for hrefs (if set, overrides listenAddr)
 	httpClient     *http.Client
 	httpServer     *http.Server
 	isRunning      bool
@@ -1846,10 +1847,18 @@ func (c *nmosController) GetNodeID() string {
 
 // GetListenAddr returns the actual address the HTTP server is listening on
 func (c *nmosController) GetListenAddr() string {
+	if c.advertisedAddr != "" {
+		return c.advertisedAddr
+	}
 	if c.listenAddr != "" {
 		return c.listenAddr
 	}
 	return c.nodeAddr
+}
+
+// SetAdvertisedAddr sets the externally reachable address for NMOS hrefs
+func (c *nmosController) SetAdvertisedAddr(addr string) {
+	c.advertisedAddr = addr
 }
 
 // listenForEvents listens for NMOS IS-05 events from the registry

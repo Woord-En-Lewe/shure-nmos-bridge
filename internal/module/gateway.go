@@ -69,6 +69,11 @@ func (g *gatewayImpl) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to create nmos controller")
 	}
 
+	// Discover and set externally reachable address for NMOS hrefs
+	if localIP := discoverLocalIP(); localIP != "" {
+		g.nmosCtrl.SetAdvertisedAddr(localIP)
+	}
+
 	if err := g.nmosCtrl.Start(ctx); err != nil {
 		return err
 	}
@@ -1031,4 +1036,27 @@ func (g *gatewayImpl) reapStaleDevices(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// discoverLocalIP returns the first non-loopback IPv4 address found on the machine
+func discoverLocalIP() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if ip4 := addr.(*net.IPNet).IP.To4(); ip4 != nil && !ip4.IsLoopback() {
+				return ip4.String()
+			}
+		}
+	}
+	return ""
 }
