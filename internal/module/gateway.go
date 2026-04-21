@@ -1045,7 +1045,7 @@ func discoverLocalIP() string {
 		return ""
 	}
 	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback == 0 {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
 		addrs, err := iface.Addrs()

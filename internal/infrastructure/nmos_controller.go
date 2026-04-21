@@ -1847,8 +1847,9 @@ func (c *nmosController) GetNodeID() string {
 
 // GetListenAddr returns the actual address the HTTP server is listening on
 func (c *nmosController) GetListenAddr() string {
-	if c.advertisedAddr != "" {
-		return c.advertisedAddr
+	if c.advertisedAddr != "" && c.listenAddr != "" {
+		_, port, _ := net.SplitHostPort(c.listenAddr)
+		return net.JoinHostPort(c.advertisedAddr, port)
 	}
 	if c.listenAddr != "" {
 		return c.listenAddr
