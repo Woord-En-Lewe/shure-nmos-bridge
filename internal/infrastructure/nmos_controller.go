@@ -124,7 +124,7 @@ func NewNMOSController(addr string) NMOSController {
 // NewNMOSControllerWithConfig creates a new NMOSController instance with custom registry discovery config
 func NewNMOSControllerWithConfig(addr string, registryConfig RegistryDiscoveryConfig) NMOSController {
 	if addr == "" {
-		addr = "localhost:8080" // Default NMOS Node API address
+		addr = "0.0.0.0:8080" // Default NMOS Node API address
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	nodeID := uuid.New().String()

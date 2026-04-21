@@ -15,7 +15,7 @@ import (
 func main() {
 	// Parse command line flags
 	shureAddr := flag.String("shure-addr", "", "Shure Axient control protocol address (optional, defaults to mDNS discovery)")
-	nmosAddr := flag.String("nmos-addr", "localhost:8080", "NMOS Node API address")
+	nmosAddr := flag.String("nmos-addr", "0.0.0.0:8080", "NMOS Node API address")
 	registryDiscoveryMode := flag.String("registry-discovery", "mdns", "Registry discovery mode: mdns, dns_sd, or static")
 	registryDomain := flag.String("registry-domain", "local.", "DNS domain for DNS-SD discovery (used when registry-discovery is dns_sd)")
 	registryStaticURL := flag.String("registry-url", "", "Static registry URL (used when registry-discovery is static)")
