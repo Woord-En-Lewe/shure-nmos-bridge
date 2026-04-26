@@ -15,8 +15,6 @@ const (
 	WorkerTypeGroupChan         WorkerType = 4
 	WorkerTypeTX                WorkerType = 5
 	WorkerTypeBattery           WorkerType = 6
-	WorkerTypeAudioLevel        WorkerType = 7
-	WorkerTypeRSSI              WorkerType = 8
 	WorkerTypeFWVer             WorkerType = 9
 	WorkerTypeDeviceID          WorkerType = 10
 	WorkerTypeEncryption        WorkerType = 11
@@ -39,9 +37,6 @@ const (
 	WorkerTypeTxMuteButtonStatus WorkerType = 28
 	WorkerTypeTxPowerSource     WorkerType = 29
 	WorkerTypeEncryptionWarning WorkerType = 30
-	WorkerTypeAntStatus        WorkerType = 31
-	WorkerTypeRFLevel          WorkerType = 32
-	WorkerTypeAudioLevelMeter  WorkerType = 33
 )
 
 // WorkerTypeClassID maps worker type to class ID for a model family
@@ -54,8 +49,6 @@ var WorkerTypeClassID = map[ShureModelFamily]map[WorkerType][]int{
 		WorkerTypeGroupChan:   []int{1, 2, 1, 14},
 		WorkerTypeTX:          []int{1, 2, 1, 15},
 		WorkerTypeBattery:     []int{1, 2, 1, 16},
-		WorkerTypeAudioLevel:  []int{1, 2, 1, 17},
-		WorkerTypeRSSI:        []int{1, 2, 1, 18},
 	},
 	ModelFamilyULXD: {
 		WorkerTypeGain:        []int{1, 2, 1, 10},
@@ -65,8 +58,6 @@ var WorkerTypeClassID = map[ShureModelFamily]map[WorkerType][]int{
 		WorkerTypeGroupChan:   []int{1, 2, 1, 14},
 		WorkerTypeTX:          []int{1, 2, 1, 15},
 		WorkerTypeBattery:     []int{1, 2, 1, 16},
-		WorkerTypeAudioLevel:  []int{1, 2, 1, 17},
-		WorkerTypeRSSI:        []int{1, 2, 1, 18},
 	},
 	ModelFamilyQLXD: {
 		WorkerTypeGain:               []int{1, 2, 1, 10},
@@ -75,8 +66,6 @@ var WorkerTypeClassID = map[ShureModelFamily]map[WorkerType][]int{
 		WorkerTypeFreq:              []int{1, 2, 1, 13},
 		WorkerTypeGroupChan:         []int{1, 2, 1, 14},
 		WorkerTypeBattery:           []int{1, 2, 1, 16},
-		WorkerTypeAudioLevel:        []int{1, 2, 1, 17},
-		WorkerTypeRSSI:              []int{1, 2, 1, 18},
 		WorkerTypeFWVer:             []int{1, 2, 1, 19},
 		WorkerTypeDeviceID:          []int{1, 2, 1, 20},
 		WorkerTypeEncryption:        []int{1, 2, 1, 21},
@@ -99,9 +88,6 @@ var WorkerTypeClassID = map[ShureModelFamily]map[WorkerType][]int{
 		WorkerTypeTxMuteButtonStatus: []int{1, 2, 1, 38},
 		WorkerTypeTxPowerSource:    []int{1, 2, 1, 39},
 		WorkerTypeEncryptionWarning: []int{1, 2, 1, 40},
-		WorkerTypeAntStatus:        []int{1, 2, 1, 41},
-		WorkerTypeRFLevel:          []int{1, 2, 1, 42},
-		WorkerTypeAudioLevelMeter:  []int{1, 2, 1, 43},
 	},
 	ModelFamilySLXD: {
 		WorkerTypeGain:        []int{1, 2, 1, 10},
@@ -111,8 +97,6 @@ var WorkerTypeClassID = map[ShureModelFamily]map[WorkerType][]int{
 		WorkerTypeGroupChan:   []int{1, 2, 1, 14},
 		WorkerTypeTX:          []int{1, 2, 1, 15},
 		WorkerTypeBattery:     []int{1, 2, 1, 16},
-		WorkerTypeAudioLevel:  []int{1, 2, 1, 17},
-		WorkerTypeRSSI:        []int{1, 2, 1, 18},
 	},
 	ModelFamilySLXDPlus: {
 		WorkerTypeGain:        []int{1, 2, 1, 10},
@@ -122,8 +106,6 @@ var WorkerTypeClassID = map[ShureModelFamily]map[WorkerType][]int{
 		WorkerTypeGroupChan:   []int{1, 2, 1, 14},
 		WorkerTypeTX:          []int{1, 2, 1, 15},
 		WorkerTypeBattery:     []int{1, 2, 1, 16},
-		WorkerTypeAudioLevel:  []int{1, 2, 1, 17},
-		WorkerTypeRSSI:        []int{1, 2, 1, 18},
 	},
 }
 
@@ -159,8 +141,6 @@ func ChannelWorkersConfig(family ShureModelFamily) []ChannelWorkerConfig {
 			{WorkerTypeGroupChan, "GroupChannel", "GROUP_CHAN", []int{1, 2, 1, 14}, false, "NcString"},
 			{WorkerTypeTX, "Transmitter", "TX_ALL", []int{1, 2, 1, 15}, true, "NcString"},
 			{WorkerTypeBattery, "Battery", "BATT_ALL", []int{1, 2, 1, 16}, true, "NcString"},
-			{WorkerTypeAudioLevel, "AudioLevel", "AUDIO_LEVEL", []int{1, 2, 1, 17}, true, "NcString"},
-			{WorkerTypeRSSI, "RSSI", "RF_RSSI", []int{1, 2, 1, 18}, true, "NcString"},
 		}
 	case ModelFamilyULXD:
 		return []ChannelWorkerConfig{
@@ -171,8 +151,6 @@ func ChannelWorkersConfig(family ShureModelFamily) []ChannelWorkerConfig {
 			{WorkerTypeGroupChan, "GroupChannel", "GROUP_CHAN", []int{1, 2, 1, 14}, false, "NcString"},
 			{WorkerTypeTX, "Transmitter", "TX_TYPE", []int{1, 2, 1, 15}, true, "NcString"},
 			{WorkerTypeBattery, "Battery", "TX_BATT_MINS", []int{1, 2, 1, 16}, true, "NcString"},
-			{WorkerTypeAudioLevel, "AudioLevel", "AUDIO_LVL", []int{1, 2, 1, 17}, true, "NcString"},
-			{WorkerTypeRSSI, "RSSI", "RX_RF_LVL", []int{1, 2, 1, 18}, true, "NcString"},
 		}
 	case ModelFamilyQLXD:
 		return []ChannelWorkerConfig{
@@ -180,9 +158,6 @@ func ChannelWorkersConfig(family ShureModelFamily) []ChannelWorkerConfig {
 			{WorkerTypeFreq, "Frequency", "FREQUENCY", []int{1, 2, 1, 13}, false, "NcString"},
 			{WorkerTypeGroupChan, "GroupChannel", "GROUP_CHAN", []int{1, 2, 1, 14}, false, "NcString"},
 			{WorkerTypeEncryptionWarning, "EncryptionWarning", "ENCRYPTION_WARNING", []int{1, 2, 1, 40}, true, "NcBoolean"},
-			{WorkerTypeAntStatus, "AntennaStatus", "ANT_STATUS", []int{1, 2, 1, 41}, true, "NcString"},
-			{WorkerTypeRFLevel, "RFLevel", "RF_LEVEL", []int{1, 2, 1, 42}, true, "NcString"},
-			{WorkerTypeAudioLevelMeter, "AudioLevel", "AUDIO_LEVEL", []int{1, 2, 1, 43}, true, "NcString"},
 		}
 	case ModelFamilySLXD:
 		return []ChannelWorkerConfig{
@@ -193,8 +168,6 @@ func ChannelWorkersConfig(family ShureModelFamily) []ChannelWorkerConfig {
 			{WorkerTypeGroupChan, "GroupChannel", "GROUP_CHANNEL", []int{1, 2, 1, 14}, false, "NcString"},
 			{WorkerTypeTX, "Transmitter", "TX_MODEL", []int{1, 2, 1, 15}, true, "NcString"},
 			{WorkerTypeBattery, "Battery", "TX_BATT_MINS", []int{1, 2, 1, 16}, true, "NcString"},
-			{WorkerTypeAudioLevel, "AudioLevel", "AUDIO_LEVEL_RMS", []int{1, 2, 1, 17}, true, "NcString"},
-			{WorkerTypeRSSI, "RSSI", "RSSI", []int{1, 2, 1, 18}, true, "NcString"},
 		}
 	case ModelFamilySLXDPlus:
 		return []ChannelWorkerConfig{
@@ -205,8 +178,6 @@ func ChannelWorkersConfig(family ShureModelFamily) []ChannelWorkerConfig {
 			{WorkerTypeGroupChan, "GroupChannel", "GROUP_CHANNEL", []int{1, 2, 1, 14}, false, "NcString"},
 			{WorkerTypeTX, "Transmitter", "LINK_TX_MODEL", []int{1, 2, 1, 15}, true, "NcString"},
 			{WorkerTypeBattery, "Battery", "TX_BATT_MINS", []int{1, 2, 1, 16}, true, "NcString"},
-			{WorkerTypeAudioLevel, "AudioLevel", "AUDIO_LEVEL_RMS", []int{1, 2, 1, 17}, true, "NcString"},
-			{WorkerTypeRSSI, "RSSI", "RSSI", []int{1, 2, 1, 18}, true, "NcString"},
 		}
 	default:
 		return nil

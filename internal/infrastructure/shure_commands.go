@@ -431,16 +431,47 @@ func IsMeteredParam(param string) bool {
 	// Normalize spaces to underscores for QLX-D/ULX-D compatibility
 	normalized := strings.ReplaceAll(param, " ", "_")
 	switch normalized {
-	case "CHAN_QUALITY", "AUDIO_LED_BITMAP", "AUDIO_LEVEL_PEAK", "AUDIO_LEVEL_RMS", "AUDIO_LEVEL",
+	case "CHAN_QUALITY", "AUDIO_LED_BITMAP", "AUDIO_LEVEL_PEAK", "AUDIO_LEVEL_RMS", "AUDIO_LEVEL", "AUDIO_LVL",
 		"ANTENNA_STATUS", "RF_LED_BITMAP_A", "RF_RSSI_A", "RF_LED_BITMAP_B", "RF_RSSI_B",
 		"RF_LED_BITMAP_C", "RF_RSSI_C", "RF_LED_BITMAP_D", "RF_RSSI_D",
 		"RF_LED_BITMAP_F1", "RF_RSSI_F1", "RF_LED_BITMAP_F2", "RF_RSSI_F2",
-		"AUDIO_SUMMING", "RF_LEVEL", "RF_RSSI", "AUDIO_PEAK", "AUDIO_RMS",
+		"AUDIO_SUMMING", "RF_LEVEL", "RF_RSSI", "RX_RF_LVL", "AUDIO_PEAK", "AUDIO_RMS",
 		"TX_BATT_BARS", "TX_BATT_CHARGE_PERCENT", "TX_BATT_MINS", "TX_BATT_TEMP_C",
-		"TX_BATT_CYCLE_COUNT", "TX_BATT_HEALTH_PERCENT":
+		"TX_BATT_CYCLE_COUNT", "TX_BATT_HEALTH_PERCENT", "RF_ANTENNA":
 		return true
 	default:
 		return false
+	}
+}
+
+// GetIS07MeteredParams returns the metered parameters for SAMPLE commands per model family.
+// Only SAMPLE commands should register IS-07 resources, not REP commands.
+func GetIS07MeteredParams(modelFamily ShureModelFamily) []string {
+	switch modelFamily {
+	case ModelFamilyAxientDigital:
+		return []string{
+			"CHAN_QUALITY", "AUDIO_LED_BITMAP",
+			"AUDIO_LEVEL_PEAK", "AUDIO_LEVEL_RMS",
+			"ANTENNA_A_ACTIVE", "ANTENNA_B_ACTIVE",
+			"RF_LED_BITMAP_A", "RF_RSSI_A",
+			"RF_LED_BITMAP_B", "RF_RSSI_B",
+			"RF_LED_BITMAP_C", "RF_RSSI_C",
+			"RF_LED_BITMAP_D", "RF_RSSI_D",
+			"RF_LED_BITMAP_F1", "RF_RSSI_F1",
+			"RF_LED_BITMAP_F2", "RF_RSSI_F2",
+		}
+	case ModelFamilyULXD, ModelFamilyQLXD:
+		return []string{
+			"ANTENNA_A_ACTIVE", "ANTENNA_B_ACTIVE",
+			"RF_LEVEL", "AUDIO_LVL",
+		}
+	case ModelFamilySLXD, ModelFamilySLXDPlus:
+		return []string{
+			"AUDIO_LEVEL_PEAK", "AUDIO_LEVEL_RMS",
+			"RF_RSSI",
+		}
+	default:
+		return nil
 	}
 }
 

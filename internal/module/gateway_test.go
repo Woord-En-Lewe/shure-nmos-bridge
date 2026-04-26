@@ -46,6 +46,7 @@ func (m *mockNMOSController) UpdateResource(resourceType string, id string, upda
 }
 func (m *mockNMOSController) GetControls(deviceID string) []map[string]interface{}           { return nil }
 func (m *mockNMOSController) SetControls(deviceID string, controls []map[string]interface{}) {}
+func (m *mockNMOSController) GetListenAddr() string { return "127.0.0.1:8080" }
 
 type mockShureController struct {
 	infrastructure.ShureController
@@ -64,34 +65,57 @@ func TestHandleShureDevice(t *testing.T) {
 	}
 
 	addr := "192.168.1.10:2202"
-	sourceMap := make(map[string]string)
-	sourceMap["CHAN_QUALITY"] = "source-quality"
-	sourceMap["AUDIO_LED_BITMAP"] = "source-led"
-	sourceMap["AUDIO_LEVEL_PEAK"] = "source-peak"
-	sourceMap["AUDIO_LEVEL_RMS"] = "source-rms"
-	sourceMap["ANTENNA_STATUS"] = "source-ant"
-	sourceMap["RF_LED_BITMAP_A"] = "source-rf-led-a"
-	sourceMap["RF_RSSI_A"] = "source-rssi-a"
-	sourceMap["RF_LED_BITMAP_B"] = "source-rf-led-b"
-	sourceMap["RF_RSSI_B"] = "source-rssi-b"
-	// ... add others as needed for test
+	sourceMap := map[string]string{
+		"CHAN_QUALITY":     "source-quality",
+		"AUDIO_LED_BITMAP": "source-led",
+		"AUDIO_LEVEL_PEAK": "source-peak",
+		"AUDIO_LEVEL_RMS":  "source-rms",
+		"ANTENNA_STATUS":   "source-ant",
+		"ANTENNA_A_ACTIVE": "source-ant-a",
+		"ANTENNA_B_ACTIVE": "source-ant-b",
+		"RF_LED_BITMAP_A":  "source-rf-led-a",
+		"RF_RSSI_A":        "source-rssi-a",
+		"RF_LED_BITMAP_B":  "source-rf-led-b",
+		"RF_RSSI_B":        "source-rssi-b",
+		"RF_LED_BITMAP_C":  "source-rf-led-c",
+		"RF_RSSI_C":        "source-rssi-c",
+		"RF_LED_BITMAP_D":  "source-rf-led-d",
+		"RF_RSSI_D":        "source-rssi-d",
+		"RF_LED_BITMAP_F1": "source-rf-led-f1",
+		"RF_RSSI_F1":       "source-rssi-f1",
+		"RF_LED_BITMAP_F2": "source-rf-led-f2",
+		"RF_RSSI_F2":       "source-rssi-f2",
+	}
 
-	flowMap := make(map[string]string)
-	flowMap["CHAN_QUALITY"] = "flow-quality"
-	flowMap["AUDIO_LED_BITMAP"] = "flow-led"
-	flowMap["AUDIO_LEVEL_PEAK"] = "flow-peak"
-	flowMap["AUDIO_LEVEL_RMS"] = "flow-rms"
-	flowMap["ANTENNA_STATUS"] = "flow-ant"
-	flowMap["RF_LED_BITMAP_A"] = "flow-rf-led-a"
-	flowMap["RF_RSSI_A"] = "flow-rssi-a"
-	flowMap["RF_LED_BITMAP_B"] = "flow-rf-led-b"
-	flowMap["RF_RSSI_B"] = "flow-rssi-b"
+	flowMap := map[string]string{
+		"CHAN_QUALITY":     "flow-quality",
+		"AUDIO_LED_BITMAP": "flow-led",
+		"AUDIO_LEVEL_PEAK": "flow-peak",
+		"AUDIO_LEVEL_RMS":  "flow-rms",
+		"ANTENNA_STATUS":   "flow-ant",
+		"ANTENNA_A_ACTIVE": "flow-ant-a",
+		"ANTENNA_B_ACTIVE": "flow-ant-b",
+		"RF_LED_BITMAP_A":  "flow-rf-led-a",
+		"RF_RSSI_A":        "flow-rssi-a",
+		"RF_LED_BITMAP_B":  "flow-rf-led-b",
+		"RF_RSSI_B":        "flow-rssi-b",
+		"RF_LED_BITMAP_C":  "flow-rf-led-c",
+		"RF_RSSI_C":        "flow-rssi-c",
+		"RF_LED_BITMAP_D":  "flow-rf-led-d",
+		"RF_RSSI_D":        "flow-rssi-d",
+		"RF_LED_BITMAP_F1": "flow-rf-led-f1",
+		"RF_RSSI_F1":       "flow-rssi-f1",
+		"RF_LED_BITMAP_F2": "flow-rf-led-f2",
+		"RF_RSSI_F2":       "flow-rssi-f2",
+	}
 
 	g.shureCtrls[addr] = &shureDeviceInfo{
 		ctrl:          &mockShureController{},
+		modelFamily:   infrastructure.ModelFamilyAxientDigital,
 		nmosDeviceIDs: map[int]string{1: "device-1"},
 		sourceIDs:     map[int]map[string]string{1: sourceMap},
 		flowIDs:       map[int]map[string]string{1: flowMap},
+		senderIDs:     map[int]map[string]string{1: make(map[string]string)},
 		parameterOIDs: make(map[string]int),
 	}
 
@@ -109,12 +133,15 @@ func TestHandleShureDevice(t *testing.T) {
 			Payload: report,
 		})
 
-		if len(mockNMOS.broadcastEvents) != 15 {
-			t.Errorf("Expected 15 broadcast events (9 pre-registered + 6 lazy registered: ANTENNA_A/B/C/D_ACTIVE + CHAN_QUALITY + AUDIO_LED_BITMAP), got %d", len(mockNMOS.broadcastEvents))
+		// Axient SAMPLE ALL broadcasts: CHAN_QUALITY, AUDIO_LED_BITMAP, AUDIO_LEVEL_PEAK,
+		// AUDIO_LEVEL_RMS, ANTENNA_A_ACTIVE, ANTENNA_B_ACTIVE, ANTENNA_STATUS, RF_LED_BITMAP_A,
+		// RF_RSSI_A, RF_LED_BITMAP_B, RF_RSSI_B, RF_LED_BITMAP_C, RF_RSSI_C (13 events)
+		if len(mockNMOS.broadcastEvents) != 13 {
+			t.Errorf("Expected 13 broadcast events, got %d", len(mockNMOS.broadcastEvents))
 		}
 	})
 
-	t.Run("Metered parameter in REP routing - creates IS-07 sender and broadcasts", func(t *testing.T) {
+	t.Run("Metered parameter in REP routing - broadcasts if pre-registered", func(t *testing.T) {
 		mockNMOS.broadcastEvents = nil
 		report := &infrastructure.TPCIReport{
 			Type:    "REP",
@@ -128,15 +155,22 @@ func TestHandleShureDevice(t *testing.T) {
 			Payload: report,
 		})
 
-		// REP metered parameters should create IS-07 sender and broadcast current value
+		// REP metered parameters only broadcast if IS-07 resources are already registered
+		// (IS-07 resources are now registered eagerly when device connects)
 		if len(mockNMOS.broadcastEvents) != 1 {
-			t.Errorf("Expected 1 broadcast event, got %d", len(mockNMOS.broadcastEvents))
+			t.Errorf("Expected 1 broadcast event (CHAN_QUALITY was pre-registered), got %d", len(mockNMOS.broadcastEvents))
 		}
 	})
 
 	t.Run("Non-metered parameter in REP routing to NCP", func(t *testing.T) {
 		mockNMOS.broadcastEvents = nil
 		mockNMOS.ncpObjects = make(map[int]infrastructure.NcObject)
+
+		chanNameOID := 102
+		g.shureCtrls[addr].parameterOIDs["1_CHAN_NAME"] = chanNameOID
+		chanNameWorker := infrastructure.NewNcWorker(chanNameOID, []int{1, 2, 1, 12}, nil, "ChannelName", "Ch1 ChannelName")
+		mockNMOS.ncpObjects[chanNameOID] = chanNameWorker
+
 		report := &infrastructure.TPCIReport{
 			Type:    "REP",
 			Channel: 1,
@@ -154,20 +188,13 @@ func TestHandleShureDevice(t *testing.T) {
 			t.Errorf("Expected 0 broadcast events, got %d", len(mockNMOS.broadcastEvents))
 		}
 
-		// Should be in NCP
+		// Should be in NCP (worker should be updated)
 		if len(mockNMOS.ncpObjects) != 1 {
 			t.Errorf("Expected 1 NCP object, got %d", len(mockNMOS.ncpObjects))
 		}
 
 		// Get the object and check its value
-		var worker *infrastructure.NcWorker
-		for _, obj := range mockNMOS.ncpObjects {
-			if w, ok := obj.(*infrastructure.NcWorker); ok {
-				worker = w
-				break
-			}
-		}
-
+		worker := mockNMOS.ncpObjects[chanNameOID].(*infrastructure.NcWorker)
 		if worker == nil {
 			t.Fatal("NCP object is not an NcWorker")
 		}

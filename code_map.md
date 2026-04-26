@@ -107,6 +107,7 @@
   - NewShureCommandWithModel(command string, family ShureModelFamily) *ShureCommandBuilderWithModel - Factory for model-aware command builder
   - ParseTPCIResponse(response string) *TPCIReport - Parse TPCI strings into structured reports
   - IsMeteredParam(param string) bool - Identifies if a parameter is a metered property (IS-07)
+  - GetIS07MeteredParams(modelFamily ShureModelFamily) []string - Returns metered parameters for SAMPLE commands per model family
   - ParseDeviceStatus(response string) (*DeviceStatus, error) - Parse Shure responses into domain types
   - ParseSampleReport(response string) *SampleReport - Parse Axient Digital SAMPLE metering response
   - ParseULXDSampleReport(response string) *ULXDSampleReport - Parse ULX-D/QLX-D SAMPLE response

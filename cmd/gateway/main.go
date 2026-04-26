@@ -19,7 +19,24 @@ func main() {
 	registryDiscoveryMode := flag.String("registry-discovery", "mdns", "Registry discovery mode: mdns, dns_sd, or static")
 	registryDomain := flag.String("registry-domain", "local.", "DNS domain for DNS-SD discovery (used when registry-discovery is dns_sd)")
 	registryStaticURL := flag.String("registry-url", "", "Static registry URL (used when registry-discovery is static)")
+	logLevel := flag.String("log-level", "debug", "Log level: debug, info, warn, error")
 	flag.Parse()
+
+	// Configure logging level
+	var level slog.Level
+	switch *logLevel {
+	case "debug":
+		level = slog.LevelDebug
+	case "info":
+		level = slog.LevelInfo
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
 
 	// Build registry discovery config
 	registryConfig := infrastructure.RegistryDiscoveryConfig{

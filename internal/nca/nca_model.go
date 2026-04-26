@@ -764,8 +764,9 @@ func (b *Block) SetResolver(resolver func(oid int) Object) {
 
 type Worker struct {
 	BaseObject
-	Value interface{}
-	OnSet func(val interface{}) error
+	Value   interface{}
+	OnSet   func(val interface{}) error
+	OnMethod func(methodID MethodID, args json.RawMessage) (interface{}, error)
 }
 
 func NewWorker(oid int, classID []int, owner *int, role, label string) *Worker {
@@ -812,6 +813,42 @@ func (w *Worker) SetValue(value interface{}) {
 
 func (w *Worker) IsEnabled() bool {
 	return true
+}
+
+func (w *Worker) InvokeMethod(id MethodID, args json.RawMessage) (interface{}, error) {
+	if id.Level == MethodGetLevel && id.Index == MethodGetIndex {
+		var callArgs struct {
+			PropertyID PropertyID `json:"propertyId"`
+		}
+		if err := json.Unmarshal(args, &callArgs); err != nil {
+			return methodResult{Status: StatusBadCommandFormat}, nil
+		}
+		val, err := w.GetProperty(callArgs.PropertyID)
+		if err != nil {
+			return methodResult{Status: StatusPropertyNotImplemented, Value: nil}, nil
+		}
+		return methodResult{Status: StatusOk, Value: val}, nil
+	}
+
+	if id.Level == MethodSetLevel && id.Index == MethodSetIndex {
+		var callArgs struct {
+			PropertyID PropertyID  `json:"propertyId"`
+			Value      interface{} `json:"value"`
+		}
+		if err := json.Unmarshal(args, &callArgs); err != nil {
+			return methodResult{Status: StatusBadCommandFormat}, nil
+		}
+		if err := w.SetProperty(callArgs.PropertyID, callArgs.Value); err != nil {
+			return methodResult{Status: StatusDeviceError}, nil
+		}
+		return methodResult{Status: StatusOk}, nil
+	}
+
+	if w.OnMethod != nil {
+		return w.OnMethod(id, args)
+	}
+
+	return methodResult{Status: StatusMethodNotImplemented}, nil
 }
 
 func (w *Worker) notifyChange(id PropertyID, value interface{}) {

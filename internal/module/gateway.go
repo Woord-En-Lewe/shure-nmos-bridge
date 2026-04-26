@@ -2,6 +2,7 @@ package module
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -265,16 +266,17 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		},
 	})
 
-	// Initialize channel maps for lazy IS-07 resource registration
-	// IS-04/IS-07 resources (Sources, Flows, Senders) are only registered
-	// when the device actually sends data for a parameter
-	for i := 1; i <= 4; i++ {
+	// Initialize channel maps and eagerly register IS-07 resources for all SAMPLE metered params
+	// IS-07 resources (Sources, Flows, Senders) are registered immediately when the device connects
+	// so that NMOS IS-07 consumers can discover and subscribe to streams before data arrives
+	for i := 1; i <= maxChannels; i++ {
 		g.shureCtrls[addr].nmosDeviceIDs[i] = deviceID
-		// Initialize maps for lazy IS-07 resource registration
-		// Resources are only registered when the device actually sends data for a parameter
+		// Initialize maps for IS-07 resource registration
 		g.shureCtrls[addr].sourceIDs[i] = make(map[string]string)
 		g.shureCtrls[addr].flowIDs[i] = make(map[string]string)
 		g.shureCtrls[addr].senderIDs[i] = make(map[string]string)
+		// Eagerly register IS-07 resources for all SAMPLE metered parameters
+		g.ensureIS07ResourcesForChannel(g.shureCtrls[addr], i, deviceID, dev.Instance)
 	}
 }
 
@@ -289,6 +291,24 @@ func (g *gatewayImpl) setupDeviceNCP(addr string, dev infrastructure.DiscoveredD
 		Properties: []infrastructure.NcPropertyDescriptor{
 			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
 			{Name: "gain", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcFloat32"},
+		},
+		Methods: []infrastructure.NcMethodDescriptor{
+			{
+				ID:             infrastructure.NCPMethodID{Level: 3, Index: 2},
+				Name:           "IncAudioGain",
+				ResultDatatype: "NcBoolean",
+				Parameters: []infrastructure.NcParameterDescriptor{
+					{Name: "dB", TypeName: "NcFloat32"},
+				},
+			},
+			{
+				ID:             infrastructure.NCPMethodID{Level: 3, Index: 3},
+				Name:           "DecAudioGain",
+				ResultDatatype: "NcBoolean",
+				Parameters: []infrastructure.NcParameterDescriptor{
+					{Name: "dB", TypeName: "NcFloat32"},
+				},
+			},
 		},
 	})
 	g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
@@ -337,22 +357,6 @@ func (g *gatewayImpl) setupDeviceNCP(addr string, dev infrastructure.DiscoveredD
 		Properties: []infrastructure.NcPropertyDescriptor{
 			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
 			{Name: "battery", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString"},
-		},
-	})
-	g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
-		Name:    "AudioLevelWorker",
-		ClassID: []int{1, 2, 1, 17},
-		Properties: []infrastructure.NcPropertyDescriptor{
-			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
-			{Name: "audioLevel", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString"},
-		},
-	})
-	g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
-		Name:    "RSSIWorker",
-		ClassID: []int{1, 2, 1, 18},
-		Properties: []infrastructure.NcPropertyDescriptor{
-			{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
-			{Name: "rssi", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString"},
 		},
 	})
 
@@ -534,30 +538,6 @@ func (g *gatewayImpl) setupDeviceNCP(addr string, dev infrastructure.DiscoveredD
 				{Name: "encryptionWarning", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
 			},
 		})
-		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
-			Name:    "AntennaStatusWorker",
-			ClassID: []int{1, 2, 1, 41},
-			Properties: []infrastructure.NcPropertyDescriptor{
-				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
-				{Name: "antennaStatus", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
-			},
-		})
-		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
-			Name:    "RFLevelWorker",
-			ClassID: []int{1, 2, 1, 42},
-			Properties: []infrastructure.NcPropertyDescriptor{
-				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
-				{Name: "rfLevel", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
-			},
-		})
-		g.nmosCtrl.RegisterClass(infrastructure.NcClassDescriptor{
-			Name:    "AudioLevelMeterWorker",
-			ClassID: []int{1, 2, 1, 43},
-			Properties: []infrastructure.NcPropertyDescriptor{
-				{Name: "enabled", ID: infrastructure.NCPPropertyID{Level: 2, Index: 1}, TypeName: "NcBoolean", IsReadOnly: true},
-				{Name: "audioLevel", ID: infrastructure.NCPPropertyID{Level: 3, Index: 1}, TypeName: "NcString", IsReadOnly: true},
-			},
-		})
 	}
 
 	// Use a simple OID allocation (In a real app, this should be more robust)
@@ -599,35 +579,48 @@ func (g *gatewayImpl) setupDeviceNCP(addr string, dev infrastructure.DiscoveredD
 			// Create nested sub-blocks: AudioGain, Battery, TX
 			subBlockBase := channelOID * 1000
 
-			// AudioGain block with SetAudioGain, INC_AUDIO_GAIN, DEC_AUDIO_GAIN
+			// AudioGain block with GainWorker (gain property + IncAudioGain/DecAudioGain methods)
 			audioGainBlock := infrastructure.NewNcBlock(subBlockBase+1, nil, "AudioGain", fmt.Sprintf("Ch%d AudioGain", ch))
 			g.nmosCtrl.RegisterNCPObject(audioGainBlock.GetOID(), audioGainBlock)
 			channelBlock.AddItem(audioGainBlock.GetOID())
 
-			setAudioGainWorker := infrastructure.NewNcWorker(subBlockBase+10, []int{1, 2, 1, 10}, nil, "SetAudioGain", fmt.Sprintf("Ch%d SetAudioGain", ch))
-			setAudioGainWorker.OnSet = func(val interface{}) error {
+			gainWorker := infrastructure.NewNcWorker(subBlockBase+10, []int{1, 2, 1, 10}, nil, "GainWorker", fmt.Sprintf("Ch%d GainWorker", ch))
+			gainWorker.OnSet = func(val interface{}) error {
 				cmd := fmt.Sprintf("< SET %d AUDIO_GAIN %v >\n", ch, val)
 				return ctrl.SendCommand(cmd)
 			}
-			g.nmosCtrl.RegisterNCPObject(setAudioGainWorker.GetOID(), setAudioGainWorker)
-			audioGainBlock.AddItem(setAudioGainWorker.GetOID())
-			info.parameterOIDs[fmt.Sprintf("%d_%s", ch, "AUDIO_GAIN")] = setAudioGainWorker.GetOID()
-
-			incAudioGainWorker := infrastructure.NewNcWorker(subBlockBase+11, []int{1, 2, 1, 10}, nil, "IncAudioGain", fmt.Sprintf("Ch%d IncAudioGain", ch))
-			incAudioGainWorker.OnSet = func(val interface{}) error {
-				cmd := fmt.Sprintf("< SET %d AUDIO_GAIN INC %v >\n", ch, val)
-				return ctrl.SendCommand(cmd)
+			gainWorker.OnMethod = func(methodID infrastructure.NCPMethodID, args json.RawMessage) (interface{}, error) {
+				if methodID.Level == 3 && methodID.Index == 2 {
+					var callArgs struct {
+						Value interface{} `json:"value"`
+					}
+					if err := json.Unmarshal(args, &callArgs); err != nil {
+						return infrastructure.NCPMethodResult{Status: 400}, nil
+					}
+					cmd := fmt.Sprintf("< SET %d AUDIO_GAIN INC %v >\n", ch, callArgs.Value)
+					if err := ctrl.SendCommand(cmd); err != nil {
+						return infrastructure.NCPMethodResult{Status: 500}, nil
+					}
+					return infrastructure.NCPMethodResult{Status: 200}, nil
+				}
+				if methodID.Level == 3 && methodID.Index == 3 {
+					var callArgs struct {
+						Value interface{} `json:"value"`
+					}
+					if err := json.Unmarshal(args, &callArgs); err != nil {
+						return infrastructure.NCPMethodResult{Status: 400}, nil
+					}
+					cmd := fmt.Sprintf("< SET %d AUDIO_GAIN DEC %v >\n", ch, callArgs.Value)
+					if err := ctrl.SendCommand(cmd); err != nil {
+						return infrastructure.NCPMethodResult{Status: 500}, nil
+					}
+					return infrastructure.NCPMethodResult{Status: 200}, nil
+				}
+				return infrastructure.NCPMethodResult{Status: 501}, nil
 			}
-			g.nmosCtrl.RegisterNCPObject(incAudioGainWorker.GetOID(), incAudioGainWorker)
-			audioGainBlock.AddItem(incAudioGainWorker.GetOID())
-
-			decAudioGainWorker := infrastructure.NewNcWorker(subBlockBase+12, []int{1, 2, 1, 10}, nil, "DecAudioGain", fmt.Sprintf("Ch%d DecAudioGain", ch))
-			decAudioGainWorker.OnSet = func(val interface{}) error {
-				cmd := fmt.Sprintf("< SET %d AUDIO_GAIN DEC %v >\n", ch, val)
-				return ctrl.SendCommand(cmd)
-			}
-			g.nmosCtrl.RegisterNCPObject(decAudioGainWorker.GetOID(), decAudioGainWorker)
-			audioGainBlock.AddItem(decAudioGainWorker.GetOID())
+			g.nmosCtrl.RegisterNCPObject(gainWorker.GetOID(), gainWorker)
+			audioGainBlock.AddItem(gainWorker.GetOID())
+			info.parameterOIDs[fmt.Sprintf("%d_%s", ch, "AUDIO_GAIN")] = gainWorker.GetOID()
 
 			// Battery block
 			batteryBlock := infrastructure.NewNcBlock(subBlockBase+2, nil, "Battery", fmt.Sprintf("Ch%d Battery", ch))
@@ -795,10 +788,13 @@ func (g *gatewayImpl) processMessages(ctx context.Context) {
 
 // getNMOSEventType returns the NMOS event type for a Shure parameter
 // ensureIS07Resources registers IS-04/IS-07 resources for a channel/param if not already registered
-// This enables lazy registration - we only create IS-07 senders when the device actually sends data
-func (g *gatewayImpl) ensureIS07Resources(info *shureDeviceInfo, channel int, param string, deviceID string, deviceInstance string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+// Set lockHeld=true if the caller already holds g.mu, to avoid deadlock
+func (g *gatewayImpl) ensureIS07Resources(info *shureDeviceInfo, channel int, param string, deviceID string, deviceInstance string, lockHeld bool) {
+	slog.Debug("ensureIS07Resources called", "channel", channel, "param", param, "deviceID", deviceID, "deviceInstance", deviceInstance)
+	if !lockHeld {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+	}
 
 	// Check if already registered - must check if maps exist first
 	if info.sourceIDs != nil && info.sourceIDs[channel] != nil {
@@ -838,6 +834,8 @@ func (g *gatewayImpl) ensureIS07Resources(info *shureDeviceInfo, channel int, pa
 	info.senderIDs[channel][param] = senderID
 
 	eventType := getNMOSEventType(param)
+
+	slog.Info("Registering IS-07 resources", "channel", channel, "param", param, "deviceInstance", deviceInstance, "eventType", eventType)
 
 	// Register Source (IS-04)
 	g.nmosCtrl.RegisterResource("sources", map[string]interface{}{
@@ -892,18 +890,32 @@ func (g *gatewayImpl) ensureIS07Resources(info *shureDeviceInfo, channel int, pa
 	})
 }
 
+// ensureIS07ResourcesForChannel registers IS-07 resources for all metered parameters
+// that appear in SAMPLE commands for a given channel. This enables eager registration
+// when the device connects, rather than waiting for SAMPLE data to arrive.
+// Note: Caller must hold g.mu when calling this function.
+func (g *gatewayImpl) ensureIS07ResourcesForChannel(info *shureDeviceInfo, channel int, deviceID string, deviceInstance string) {
+	params := infrastructure.GetIS07MeteredParams(info.modelFamily)
+	for _, param := range params {
+		g.ensureIS07Resources(info, channel, param, deviceID, deviceInstance, true)
+	}
+}
+
 func getNMOSEventType(param string) string {
 	switch param {
-	case "AUDIO_MUTE", "MUTE":
+	case "AUDIO_MUTE", "MUTE", "TX_MUTE_STATUS":
 		return "boolean"
-	case "AUDIO_GAIN", "AUDIO_LEVEL_PEAK", "AUDIO_LEVEL_RMS", "CHAN_QUALITY",
+	case "AUDIO_GAIN", "AUDIO_LEVEL_PEAK", "AUDIO_LEVEL_RMS", "AUDIO_LEVEL", "AUDIO_LVL",
+		"CHAN_QUALITY",
 		"RF_RSSI", "RF_RSSI_A", "RF_RSSI_B", "RF_RSSI_C", "RF_RSSI_D",
-		"RF_RSSI_F1", "RF_RSSI_F2", "RF_LEVEL",
+		"RF_RSSI_F1", "RF_RSSI_F2", "RF_LEVEL", "RX_RF_LVL",
 		"TX_BATT_BARS", "TX_BATT_CHARGE_PERCENT", "TX_BATT_MINS", "TX_BATT_TEMP_C",
 		"TX_BATT_CYCLE_COUNT", "TX_BATT_HEALTH_PERCENT",
 		"AUDIO_LED_BITMAP", "RF_LED_BITMAP_A", "RF_LED_BITMAP_B",
 		"RF_LED_BITMAP_C", "RF_LED_BITMAP_D", "RF_LED_BITMAP_F1", "RF_LED_BITMAP_F2":
 		return "number"
+	case "ANTENNA_STATUS", "RF_ANTENNA":
+		return "string"
 	default:
 		return "string"
 	}
@@ -920,8 +932,11 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 	info, ok := g.shureCtrls[msg.Source]
 	g.mu.RUnlock()
 	if !ok {
+		slog.Debug("Received message from unknown device", "source", msg.Source)
 		return
 	}
+
+	slog.Debug("handleShureDevice", "source", msg.Source, "type", report.Type, "param", report.Param, "channel", report.Channel, "modelFamily", info.modelFamily)
 
 	deviceID, ok := info.nmosDeviceIDs[report.Channel]
 	if !ok {
@@ -1051,13 +1066,13 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 		}
 	}
 
-	// IS-07: Metered params create senders and broadcast events
+	// IS-07: Broadcast metered param REP events (only if already registered)
+	// IS-07 resources are now registered eagerly when device connects, so REP only broadcasts
 	if infrastructure.IsMeteredParam(report.Param) {
+		slog.Info("Received metered param REP", "source", msg.Source, "channel", report.Channel, "param", report.Param, "value", report.Value)
 		// REP responses establish current state - broadcast as IS-07 event
 		// This allows consumers to subscribe and receive current values
-		deviceID := info.nmosDeviceIDs[0]
-		deviceInstance := info.deviceInstance
-		g.ensureIS07Resources(info, report.Channel, report.Param, deviceID, deviceInstance)
+		// Only broadcast if IS-07 resources were already registered (should be due to eager registration)
 		if sID, ok := info.sourceIDs[report.Channel][report.Param]; ok {
 			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[report.Channel][report.Param], getNMOSEventType(report.Param), report.Value)
 		}
@@ -1074,11 +1089,6 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 				}
 			}
 		}
-	}
-
-	// SAMPLE ALL messages also update metered worker values
-	if report.Type == "SAMPLE" && report.Param == "ALL" {
-		g.updateMeteredWorkersFromSample(info, report)
 	}
 
 	// IS-12 NCP Parameter Updates
@@ -1231,108 +1241,86 @@ func (g *gatewayImpl) handleNMOSNode(msg infrastructure.Message) {
 }
 
 func (g *gatewayImpl) handleAxientSampleEvents(info *shureDeviceInfo, channel int, sample *infrastructure.SampleReport) {
-	deviceID := info.nmosDeviceIDs[0]
-	deviceInstance := info.deviceInstance
-
-	// Ensure IS-07 resources exist for each parameter present in the SAMPLE data
-	g.ensureIS07Resources(info, channel, "CHAN_QUALITY", deviceID, deviceInstance)
+	// IS-07 resources are registered eagerly when device connects
+	// Broadcast events for each parameter present in the SAMPLE data
 	if sID, ok := info.sourceIDs[channel]["CHAN_QUALITY"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["CHAN_QUALITY"], "number", sample.Quality)
 	}
 
-	g.ensureIS07Resources(info, channel, "AUDIO_LED_BITMAP", deviceID, deviceInstance)
 	if sID, ok := info.sourceIDs[channel]["AUDIO_LED_BITMAP"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["AUDIO_LED_BITMAP"], "number", sample.AudioLEDBitmap)
 	}
 
-	g.ensureIS07Resources(info, channel, "AUDIO_LEVEL_PEAK", deviceID, deviceInstance)
 	if sID, ok := info.sourceIDs[channel]["AUDIO_LEVEL_PEAK"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["AUDIO_LEVEL_PEAK"], "number", sample.AudioLevelPeakDBFS())
 	}
 
-	g.ensureIS07Resources(info, channel, "AUDIO_LEVEL_RMS", deviceID, deviceInstance)
 	if sID, ok := info.sourceIDs[channel]["AUDIO_LEVEL_RMS"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["AUDIO_LEVEL_RMS"], "number", sample.AudioLevelRMSDBFS())
 	}
 
-	g.ensureIS07Resources(info, channel, "ANTENNA_A_ACTIVE", deviceID, deviceInstance)
 	if sID, ok := info.sourceIDs[channel]["ANTENNA_A_ACTIVE"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["ANTENNA_A_ACTIVE"], "boolean", sample.AntennaAActive())
 	}
 
-	g.ensureIS07Resources(info, channel, "ANTENNA_B_ACTIVE", deviceID, deviceInstance)
 	if sID, ok := info.sourceIDs[channel]["ANTENNA_B_ACTIVE"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["ANTENNA_B_ACTIVE"], "boolean", sample.AntennaBActive())
 	}
 
 	if sample.RFBitmapC > 0 || sample.RFRSSI_C > 0 {
-		g.ensureIS07Resources(info, channel, "ANTENNA_C_ACTIVE", deviceID, deviceInstance)
 		if sID, ok := info.sourceIDs[channel]["ANTENNA_C_ACTIVE"]; ok {
 			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["ANTENNA_C_ACTIVE"], "boolean", sample.AntennaCActive())
 		}
 	}
 
 	if sample.RFBitmapD > 0 || sample.RFRSSI_D > 0 {
-		g.ensureIS07Resources(info, channel, "ANTENNA_D_ACTIVE", deviceID, deviceInstance)
 		if sID, ok := info.sourceIDs[channel]["ANTENNA_D_ACTIVE"]; ok {
 			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["ANTENNA_D_ACTIVE"], "boolean", sample.AntennaDActive())
 		}
 	}
 
-	g.ensureIS07Resources(info, channel, "RF_LED_BITMAP_A", deviceID, deviceInstance)
 	if sID, ok := info.sourceIDs[channel]["RF_LED_BITMAP_A"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_LED_BITMAP_A"], "number", sample.RFBitmapA)
 	}
 
-	g.ensureIS07Resources(info, channel, "RF_RSSI_A", deviceID, deviceInstance)
 	if sID, ok := info.sourceIDs[channel]["RF_RSSI_A"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_RSSI_A"], "number", sample.RFRSSI_A_DBM())
 	}
 
-	g.ensureIS07Resources(info, channel, "RF_LED_BITMAP_B", deviceID, deviceInstance)
 	if sID, ok := info.sourceIDs[channel]["RF_LED_BITMAP_B"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_LED_BITMAP_B"], "number", sample.RFBitmapB)
 	}
 
-	g.ensureIS07Resources(info, channel, "RF_RSSI_B", deviceID, deviceInstance)
 	if sID, ok := info.sourceIDs[channel]["RF_RSSI_B"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_RSSI_B"], "number", sample.RFRSSI_B_DBM())
 	}
 
 	if sample.RFBitmapC > 0 || sample.RFRSSI_C > 0 {
-		g.ensureIS07Resources(info, channel, "RF_LED_BITMAP_C", deviceID, deviceInstance)
 		if sID, ok := info.sourceIDs[channel]["RF_LED_BITMAP_C"]; ok {
 			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_LED_BITMAP_C"], "number", sample.RFBitmapC)
 		}
-		g.ensureIS07Resources(info, channel, "RF_RSSI_C", deviceID, deviceInstance)
 		if sID, ok := info.sourceIDs[channel]["RF_RSSI_C"]; ok {
 			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_RSSI_C"], "number", sample.RFRSSI_C_DBM())
 		}
-		g.ensureIS07Resources(info, channel, "RF_LED_BITMAP_D", deviceID, deviceInstance)
 		if sID, ok := info.sourceIDs[channel]["RF_LED_BITMAP_D"]; ok {
 			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_LED_BITMAP_D"], "number", sample.RFBitmapD)
 		}
-		g.ensureIS07Resources(info, channel, "RF_RSSI_D", deviceID, deviceInstance)
 		if sID, ok := info.sourceIDs[channel]["RF_RSSI_D"]; ok {
 			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_RSSI_D"], "number", sample.RFRSSI_D_DBM())
 		}
 	}
 	if sample.RFBitmapF1 > 0 || sample.RFRSSI_F1 > 0 {
-		g.ensureIS07Resources(info, channel, "RF_LED_BITMAP_F1", deviceID, deviceInstance)
 		if sID, ok := info.sourceIDs[channel]["RF_LED_BITMAP_F1"]; ok {
 			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_LED_BITMAP_F1"], "number", sample.RFBitmapF1)
 		}
-		g.ensureIS07Resources(info, channel, "RF_RSSI_F1", deviceID, deviceInstance)
 		if sID, ok := info.sourceIDs[channel]["RF_RSSI_F1"]; ok {
 			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_RSSI_F1"], "number", sample.RFRSSI_F1_DBM())
 		}
 	}
 	if sample.RFBitmapF2 > 0 || sample.RFRSSI_F2 > 0 {
-		g.ensureIS07Resources(info, channel, "RF_LED_BITMAP_F2", deviceID, deviceInstance)
 		if sID, ok := info.sourceIDs[channel]["RF_LED_BITMAP_F2"]; ok {
 			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_LED_BITMAP_F2"], "number", sample.RFBitmapF2)
 		}
-		g.ensureIS07Resources(info, channel, "RF_RSSI_F2", deviceID, deviceInstance)
 		if sID, ok := info.sourceIDs[channel]["RF_RSSI_F2"]; ok {
 			g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_RSSI_F2"], "number", sample.RFRSSI_F2_DBM())
 		}
@@ -1340,99 +1328,42 @@ func (g *gatewayImpl) handleAxientSampleEvents(info *shureDeviceInfo, channel in
 }
 
 func (g *gatewayImpl) handleULXDSampleEvents(info *shureDeviceInfo, channel int, sample *infrastructure.ULXDSampleReport) {
-	deviceID := info.nmosDeviceIDs[0]
-	deviceInstance := info.deviceInstance
-
 	aActive := sample.AntStatus == infrastructure.AntennaAOn
 	bActive := sample.AntStatus == infrastructure.AntennaBOn
 
-	g.ensureIS07Resources(info, channel, "ANTENNA_A_ACTIVE", deviceID, deviceInstance)
+	// IS-07 resources are registered eagerly when device connects
+	// Broadcast events for each parameter
 	if sID, ok := info.sourceIDs[channel]["ANTENNA_A_ACTIVE"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["ANTENNA_A_ACTIVE"], "boolean", aActive)
 	}
 
-	g.ensureIS07Resources(info, channel, "ANTENNA_B_ACTIVE", deviceID, deviceInstance)
 	if sID, ok := info.sourceIDs[channel]["ANTENNA_B_ACTIVE"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["ANTENNA_B_ACTIVE"], "boolean", bActive)
 	}
 
-	g.ensureIS07Resources(info, channel, "RF_LEVEL", deviceID, deviceInstance)
 	if sID, ok := info.sourceIDs[channel]["RF_LEVEL"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_LEVEL"], "number", sample.RFLevelDBM())
 	}
 
-	g.ensureIS07Resources(info, channel, "AUDIO_LEVEL_PEAK", deviceID, deviceInstance)
-	if sID, ok := info.sourceIDs[channel]["AUDIO_LEVEL_PEAK"]; ok {
-		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["AUDIO_LEVEL_PEAK"], "number", sample.AudioLevelDBFS())
-	}
-
-	g.ensureIS07Resources(info, channel, "AUDIO_LEVEL_RMS", deviceID, deviceInstance)
-	if sID, ok := info.sourceIDs[channel]["AUDIO_LEVEL_RMS"]; ok {
-		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["AUDIO_LEVEL_RMS"], "number", sample.AudioLevelDBFS())
+	// ULX-D/QLX-D SAMPLE only provides a single AUDIO_LVL value (not separate PEAK and RMS)
+	if sID, ok := info.sourceIDs[channel]["AUDIO_LVL"]; ok {
+		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["AUDIO_LVL"], "number", sample.AudioLevelDBFS())
 	}
 }
 
 func (g *gatewayImpl) handleSLDXSampleEvents(info *shureDeviceInfo, channel int, sample *infrastructure.SLDXSampleReport) {
-	deviceID := info.nmosDeviceIDs[0]
-	deviceInstance := info.deviceInstance
-
-	g.ensureIS07Resources(info, channel, "AUDIO_LEVEL_PEAK", deviceID, deviceInstance)
+	// IS-07 resources are registered eagerly when device connects
+	// Broadcast events for each parameter
 	if sID, ok := info.sourceIDs[channel]["AUDIO_LEVEL_PEAK"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["AUDIO_LEVEL_PEAK"], "number", sample.AudioPeakDBFS())
 	}
 
-	g.ensureIS07Resources(info, channel, "AUDIO_LEVEL_RMS", deviceID, deviceInstance)
 	if sID, ok := info.sourceIDs[channel]["AUDIO_LEVEL_RMS"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["AUDIO_LEVEL_RMS"], "number", sample.AudioRMSDBFS())
 	}
 
-	g.ensureIS07Resources(info, channel, "RF_RSSI", deviceID, deviceInstance)
 	if sID, ok := info.sourceIDs[channel]["RF_RSSI"]; ok {
 		g.nmosCtrl.BroadcastEvent(sID, info.flowIDs[channel]["RF_RSSI"], "number", sample.RFRSSIDBM())
-	}
-}
-
-// updateMeteredWorkersFromSample updates NCP worker values from SAMPLE data
-func (g *gatewayImpl) updateMeteredWorkersFromSample(info *shureDeviceInfo, report *infrastructure.TPCIReport) {
-	switch info.modelFamily {
-	case infrastructure.ModelFamilyAxientDigital:
-		if sample := infrastructure.ParseSampleReport(report.Raw); sample != nil {
-			channel := report.Channel
-			g.updateWorkerValue(info, channel, "AUDIO_LEVEL_PEAK", sample.AudioLevelPeakDBFS())
-			g.updateWorkerValue(info, channel, "AUDIO_LEVEL_RMS", sample.AudioLevelRMSDBFS())
-			g.updateWorkerValue(info, channel, "RF_RSSI_A", sample.RFRSSI_A_DBM())
-			g.updateWorkerValue(info, channel, "RF_RSSI_B", sample.RFRSSI_B_DBM())
-		}
-	case infrastructure.ModelFamilyULXD, infrastructure.ModelFamilyQLXD:
-		if sample := infrastructure.ParseULXDSampleReport(report.Raw); sample != nil {
-			channel := report.Channel
-			g.updateWorkerValue(info, channel, "ANT_STATUS", string(sample.AntStatus))
-			g.updateWorkerValue(info, channel, "RF_LEVEL", sample.RFLevelDBM())
-			g.updateWorkerValue(info, channel, "AUDIO_LEVEL", sample.AudioLevelDBFS())
-		}
-	case infrastructure.ModelFamilySLXD, infrastructure.ModelFamilySLXDPlus:
-		if sample := infrastructure.ParseSLDXSampleReport(report.Raw); sample != nil {
-			channel := report.Channel
-			g.updateWorkerValue(info, channel, "AUDIO_LEVEL_PEAK", sample.AudioPeakDBFS())
-			g.updateWorkerValue(info, channel, "AUDIO_LEVEL_RMS", sample.AudioRMSDBFS())
-			g.updateWorkerValue(info, channel, "RF_RSSI", sample.RFRSSIDBM())
-		}
-	}
-}
-
-// updateWorkerValue updates a worker's value if it exists
-func (g *gatewayImpl) updateWorkerValue(info *shureDeviceInfo, channel int, param string, value interface{}) {
-	paramKey := fmt.Sprintf("%d_%s", channel, param)
-	g.mu.Lock()
-	oid, exists := info.parameterOIDs[paramKey]
-	g.mu.Unlock()
-	if !exists {
-		return
-	}
-	if obj := g.nmosCtrl.GetNCPObject(oid); obj != nil {
-		if worker, ok := obj.(*infrastructure.NcWorker); ok {
-			worker.SetProperty(infrastructure.NCPPropertyID{Level: 3, Index: 1}, value)
-		}
 	}
 }
 
