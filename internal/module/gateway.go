@@ -844,11 +844,10 @@ func (g *gatewayImpl) ensureIS07Resources(info *shureDeviceInfo, channel int, pa
 		"label":       fmt.Sprintf("%s Channel %d %s", deviceInstance, channel, param),
 		"description": fmt.Sprintf("Event source for %s on Channel %d", param, channel),
 		"format":      "urn:x-nmos:format:data",
-		"caps":        map[string]interface{}{},
 		"device_id":   deviceID,
-		"parents":     []string{},
-		"clock_name":  nil,
 		"event_type":  eventType,
+		"tags":        map[string]interface{}{},
+		"grain_rate":  map[string]int{"numerator": 1, "denominator": 1000000000},
 	})
 
 	// Register Flow (IS-04)
@@ -858,12 +857,13 @@ func (g *gatewayImpl) ensureIS07Resources(info *shureDeviceInfo, channel int, pa
 		"label":       fmt.Sprintf("%s Channel %d %s Flow", deviceInstance, channel, param),
 		"description": fmt.Sprintf("Event flow for %s on Channel %d", param, channel),
 		"format":      "urn:x-nmos:format:data",
-		"tags":        map[string]interface{}{},
 		"source_id":   sourceID,
 		"device_id":   deviceID,
 		"parents":     []string{},
+		"tags":        map[string]interface{}{},
 		"media_type":  "application/json",
 		"event_type":  eventType,
+		"grain_rate":  map[string]int{"numerator": 1, "denominator": 1000000000},
 	})
 
 	// Register Sender (IS-04) with IS-05/IS-07 transport parameters
@@ -883,8 +883,10 @@ func (g *gatewayImpl) ensureIS07Resources(info *shureDeviceInfo, channel int, pa
 		},
 		"transport_params": []map[string]interface{}{
 			{
-				"ext_is_07_rest_api_url": fmt.Sprintf("http://%s/x-nmos/events/v1.0/sources/%s/", g.nmosCtrl.GetListenAddr(), sourceID),
-				"ext_is_07_source_id":    sourceID,
+				"connection_uri":            fmt.Sprintf("ws://%s/x-nmos/events/v1.0/ws", g.nmosCtrl.GetListenAddr()),
+				"connection_authorization": false,
+				"ext_is_07_rest_api_url":   fmt.Sprintf("http://%s/x-nmos/events/v1.0/sources/%s/", g.nmosCtrl.GetListenAddr(), sourceID),
+				"ext_is_07_source_id":     sourceID,
 			},
 		},
 	})

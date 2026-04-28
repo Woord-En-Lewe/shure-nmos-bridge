@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,11 +18,22 @@ func main() {
 	// Parse command line flags
 	shureAddr := flag.String("shure-addr", "", "Shure Axient control protocol address (optional, defaults to mDNS discovery)")
 	nmosAddr := flag.String("nmos-addr", "0.0.0.0:8080", "NMOS Node API address")
+	nmosPort := flag.Int("port", 0, "NMOS Node API port (overrides nmos-addr port if set)")
 	registryDiscoveryMode := flag.String("registry-discovery", "mdns", "Registry discovery mode: mdns, dns_sd, or static")
 	registryDomain := flag.String("registry-domain", "local.", "DNS domain for DNS-SD discovery (used when registry-discovery is dns_sd)")
 	registryStaticURL := flag.String("registry-url", "", "Static registry URL (used when registry-discovery is static)")
 	logLevel := flag.String("log-level", "debug", "Log level: debug, info, warn, error")
 	flag.Parse()
+
+	// Override port in nmosAddr if specified
+	nmosAddrVal := *nmosAddr
+	if *nmosPort != 0 {
+		host, _, _ := net.SplitHostPort(nmosAddrVal)
+		if host == "" {
+			host = "0.0.0.0"
+		}
+		nmosAddrVal = net.JoinHostPort(host, fmt.Sprintf("%d", *nmosPort))
+	}
 
 	// Configure logging level
 	var level slog.Level
@@ -36,7 +49,7 @@ func main() {
 	default:
 		level = slog.LevelDebug
 	}
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level, AddSource: true})))
 
 	// Build registry discovery config
 	registryConfig := infrastructure.RegistryDiscoveryConfig{
@@ -57,7 +70,7 @@ func main() {
 	defer cancel()
 
 	// Create the gateway module
-	gateway := module.NewGateway(*shureAddr, *nmosAddr, registryConfig)
+	gateway := module.NewGateway(*shureAddr, nmosAddrVal, registryConfig)
 
 	// Start the gateway
 	if err := gateway.Start(ctx); err != nil {

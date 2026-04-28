@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -237,6 +239,13 @@ func (c *nmosController) Start(ctx context.Context) error {
 		c.checkIS07Heartbeats(ctx)
 	}()
 
+	// Start IS-07 WebSocket ping goroutine to keep connections alive
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.pingIS07Clients(ctx)
+	}()
+
 	return nil
 }
 
@@ -400,6 +409,11 @@ func (c *nmosController) registerResourceToRegistry(ctx context.Context, resourc
 		return fmt.Errorf("failed to marshal resource: %w", err)
 	}
 
+	slog.Debug("Registering resource with registry",
+		"type", resourceType,
+		"url", fmt.Sprintf("%s/x-nmos/registration/v1.3/resource", c.registryURL),
+		"requestBody", string(resourceJSON))
+
 	// POST to registry
 	req, err := http.NewRequestWithContext(ctx, "POST",
 		fmt.Sprintf("%s/x-nmos/registration/v1.3/resource", c.registryURL),
@@ -414,6 +428,26 @@ func (c *nmosController) registerResourceToRegistry(ctx context.Context, resourc
 		return fmt.Errorf("failed to register resource with registry: %w", err)
 	}
 	defer resp.Body.Close()
+
+	// Read response body for logging
+	respBody, _ := io.ReadAll(resp.Body)
+	slog.Debug("Registry response",
+		"type", resourceType,
+		"statusCode", resp.StatusCode,
+		"responseBody", string(respBody))
+
+	// Check for error code in JSON response body (NMOS registries may return 200 with error in body)
+	var respJSON map[string]interface{}
+	if err := json.Unmarshal(respBody, &respJSON); err == nil {
+		if code, ok := respJSON["code"].(float64); ok && int(code) >= 400 {
+			slog.Error("Registry returned error",
+				"type", resourceType,
+				"httpStatus", resp.StatusCode,
+				"errorCode", int(code),
+				"errorMessage", respJSON["error"])
+			return fmt.Errorf("registry error: %s (code %d)", respJSON["error"], int(code))
+		}
+	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		slog.Info("Registered resource with registry", "type", resourceType)
@@ -625,10 +659,16 @@ func (c *nmosController) discoverUnicastDNS(ctx context.Context, domain string) 
 
 // buildNodeResource creates the node resource for IS-04 registration
 func (c *nmosController) buildNodeResource(nodeID string) map[string]interface{} {
-	host, portStr := splitHostPort(c.nodeAddr)
+	listenAddr := c.GetListenAddr()
+	host, portStr := splitHostPort(listenAddr)
 	port := 8080
 	if p, err := strconv.Atoi(portStr); err == nil {
 		port = p
+	}
+
+	hostname := host
+	if c.advertisedAddr != "" {
+		hostname = c.advertisedAddr
 	}
 
 	return map[string]interface{}{
@@ -644,7 +684,7 @@ func (c *nmosController) buildNodeResource(nodeID string) map[string]interface{}
 				{"host": host, "port": port, "protocol": "http"},
 			},
 		},
-		"hostname":   host,
+		"hostname":   hostname,
 		"interfaces": []interface{}{},
 		"clocks":     []interface{}{},
 	}
@@ -1390,6 +1430,7 @@ func (c *nmosController) broadcastUpdate(resourceType string, resource interface
 
 	var failed []*websocket.Conn
 	for _, client := range clients {
+		client.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		if err := client.WriteMessage(websocket.TextMessage, updateJSON); err != nil {
 			slog.Error("Failed to send websocket update", "error", err)
 			failed = append(failed, client)
@@ -1438,6 +1479,34 @@ func (c *nmosController) checkIS07Heartbeats(ctx context.Context) {
 			for _, conn := range expired {
 				slog.Warn("IS-07 client heartbeat timeout, closing connection", "timeout", is07HeartbeatTimeout)
 				conn.Close()
+			}
+		}
+	}
+}
+
+func (c *nmosController) pingIS07Clients(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.done:
+			return
+		case <-ticker.C:
+			c.mu.RLock()
+			clients := make([]*websocket.Conn, 0, len(c.clients))
+			for conn := range c.clients {
+				clients = append(clients, conn)
+			}
+			c.mu.RUnlock()
+
+			for _, conn := range clients {
+				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					slog.Debug("Failed to send ping to IS-07 client", "error", err)
+				}
 			}
 		}
 	}
@@ -1754,8 +1823,16 @@ func (c *nmosController) RegisterResource(resourceType string, resource interfac
 
 			c.mu.Unlock()
 			c.broadcastUpdate(resourceType, resource)
-			// Also update in registry
-			go c.registerResourceToRegistry(c.ctx, resourceType, resource)
+			// Deep copy resource before passing to registry to avoid concurrent map access
+			resourceCopy, err := deepcopy(resource)
+			if err != nil {
+				slog.Warn("Failed to copy resource for registry", "type", resourceType, "error", err)
+				return nil
+			}
+			// Synchronously update registry to ensure correct ordering (Source → Flow → Sender)
+			if err := c.registerResourceToRegistry(c.ctx, resourceType, resourceCopy); err != nil {
+				slog.Error("Failed to register resource with registry", "type", resourceType, "error", err)
+			}
 			return nil
 		}
 	}
@@ -2133,4 +2210,40 @@ func (c *nmosController) handleConnectionSenderConstraints(w http.ResponseWriter
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode([]interface{}{})
+}
+
+// deepcopy creates a deep copy using reflection
+// This prevents concurrent map access issues when passing maps to goroutines
+func deepcopy(src interface{}) (interface{}, error) {
+	v := reflect.ValueOf(src)
+	if v.Kind() != reflect.Map {
+		return nil, fmt.Errorf("deepcopy only works on maps, got %T", src)
+	}
+	if v.Type().Key().Kind() != reflect.String {
+		return nil, fmt.Errorf("deepcopy only works on map[string]interface{}, got %T", src)
+	}
+	dst := reflect.MakeMap(v.Type())
+	for _, key := range v.MapKeys() {
+		val := v.MapIndex(key)
+		if val.Kind() == reflect.Interface {
+			val = val.Elem()
+		}
+		var copiedVal reflect.Value
+		switch val.Kind() {
+		case reflect.Map:
+			subDst, err := deepcopy(val.Interface())
+			if err != nil {
+				return nil, err
+			}
+			copiedVal = reflect.ValueOf(subDst)
+		case reflect.Slice:
+			newSlice := reflect.MakeSlice(val.Type(), val.Len(), val.Cap())
+			reflect.Copy(newSlice, val)
+			copiedVal = newSlice
+		default:
+			copiedVal = val
+		}
+		dst.SetMapIndex(key, copiedVal)
+	}
+	return dst.Interface(), nil
 }
