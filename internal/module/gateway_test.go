@@ -41,7 +41,9 @@ func (m *mockNMOSController) GetNCPObject(oid int) infrastructure.NcObject {
 	return m.ncpObjects[oid]
 }
 func (m *mockNMOSController) UpdateResource(resourceType string, id string, updateFn func(interface{}) interface{}) error {
-	// Minimal implementation for test
+	return nil
+}
+func (m *mockNMOSController) UpdateResourceInRegistry(resourceType string, id string, updateFn func(interface{}) interface{}) error {
 	return nil
 }
 func (m *mockNMOSController) GetControls(deviceID string) []map[string]interface{}           { return nil }

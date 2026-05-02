@@ -1,6 +1,7 @@
 package infrastructure
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"strconv"
 	"strings"
@@ -1960,6 +1961,20 @@ func DetectSampleFormat(response string) string {
 			}
 		}
 	}
-
 	return "unknown"
+}
+
+func DeriveUUID(source string) string {
+	hash := sha256.Sum256([]byte(source))
+	return uuidFromHash(hash[:])
+}
+
+func uuidFromHash(hash []byte) string {
+	uuidStr := fmt.Sprintf("%x", hash)
+	return fmt.Sprintf("%s-%s-%s-%s-%s",
+		uuidStr[0:8],
+		uuidStr[8:12],
+		uuidStr[12:16],
+		uuidStr[16:20],
+		uuidStr[20:32])
 }
