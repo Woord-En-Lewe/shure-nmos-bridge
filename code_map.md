@@ -53,11 +53,13 @@
   - ptrString(s string) *string - Helper for optional string values
 
 ## Module: internal/infrastructure
-- **summary**: Contains infrastructure implementations for Shure Axient control protocol, NMOS IS-04/IS-05/IS-07/IS-12, and message passing. This layer handles all external system interactions. The Shure controller implements actual TCP/IP communication with Shure Axient devices using the TPCI command protocol. Includes builder pattern for commands, domain-specific types for parsing responses, and robust mDNS discovery using the zeroconf library for automatic device detection. The NMOS controller now includes automatic registry discovery via mDNS and node self-registration per IS-04 specification, IS-07 websocket events, IS-12 NCP control protocol with subscription support and sequence methods (1m3-1m7). Includes resilient HTTP routing with middleware.CleanPath to handle double slashes and inconsistent trailing slashes from various NMOS clients. Supports all Shure networked wireless families: Axient Digital, ULX-D, QLX-D, SLX-D, and SLX-D+. The NCP types (NCPPropertyID, NCPMethodID, NCPEventID) are now type aliases to the MS-05 defined types in the nca package, and the NcObject, NcBlock, NcWorker, NcClassManager types are wrappers around the nca library implementations.
+- **summary**: Contains infrastructure implementations for Shure Axient control protocol, NMOS IS-04/IS-05/IS-07/IS-12, and message passing. This layer handles all external system interactions. The Shure controller implements actual TCP/IP communication with Shure Axient devices using the TPCI command protocol. Includes builder pattern for commands, domain-specific types for parsing responses, and robust mDNS discovery using the zeroconf library for automatic device detection. The NMOS controller now includes automatic registry discovery via mDNS and node self-registration per IS-04 specification, IS-07 websocket events, IS-12 NCP control protocol with subscription support and sequence methods (1m3-1m7). Includes resilient HTTP routing with middleware.CleanPath to handle double slashes and inconsistent trailing slashes from various NMOS clients. Supports all Shure networked wireless families: Axient Digital, ULX-D, QLX-D, SLX-D, and SLX-D+. The NCP types (NCPPropertyID, NCPMethodID, NCPEventID) are now type aliases to the MS-05 defined types in the nca package, and the NcObject, NcBlock, NcWorker, NcClassManager types are wrappers around the nca library implementations. State management is now backed by an in-memory SQLite database (Database interface) that stores devices, sources, flows, senders, receivers, Shure devices, NCP objects, and IS-07 events.
 - **when_to_use**: Use this module when you need to understand or modify how the gateway interacts with external systems (Shure devices, NMOS registry/event systems)
-- **public_types**: 
+- **public_types**:
   - ShureController - Interface for Shure Axient communication
-  - NMOSController - Interface for NMOS IS-04/IS-05/IS-07/IS-12 communication (includes UpdateResource, BroadcastEvent, SetControls, OnControlChange, GetControls, GetNodeID, SubscribeToEvents methods; automatic registry discovery; node self-registration; IS-04 heartbeat loop with re-registration; IS-05 Connection Management; IS-07 websocket events; IS-12 NCP with subscription and sequence support; handles IS-04 registration with correct singular/plural types for POST body and DELETE URL)
+  - NMOSController - Interface for NMOS IS-04/IS-05/IS-07/IS-12 communication (includes UpdateResource, BroadcastEvent, SetControls, OnControlChange, GetControls, GetNodeID, SubscribeToEvents methods; automatic registry discovery; node self-registration; IS-04 heartbeat loop with re-registration; IS-05 Connection Management; IS-07 websocket events; IS-12 NCP with subscription and sequence support; handles IS-04 registration with correct singular/plural types for POST body and DELETE URL; SetDatabase/GetDatabase for SQLite state management)
+  - Database - Interface for SQLite state storage with methods for devices, sources, flows, senders, receivers, Shure devices, NCP objects, and IS-07 events
+  - Device, Source, Flow, Sender, Receiver, ShureDevice, NCPObject, IS07Event - Data types for database entities
   - ConnectionStaged - IS-05 data structure for staged transport parameters
   - ConnectionActive - IS-05 data structure for active transport parameters
   - ConnectionActivation - IS-05 data structure for connection activation settings
@@ -79,7 +81,7 @@
   - NcWorker - Wrapper around nca.Worker implementing NcObject interface
   - MessageBus - Interface for internal message passing (defined in message_bus.go)
   - Message - Structure for messages passed between components (added Source field for origin tracking)
-  - MessageType - Type definition for message categorization (defined in message_bus.go)
+  - MessageType - Type definition for message categorization (defined in message_bus.go) - now includes IS07EventMsg, NCPPropertyMsg, ResourceUpdateMsg for DB change notifications
   - ShureCommandBuilder - Builder pattern for creating Shure commands
   - ShureCommandBuilderWithModel - Model-aware command builder that handles parameter naming per family (underscores vs spaces)
   - ShureModelFamily - Enum for Shure model families (AxientDigital, ULXD, QLXD, SLXD, SLXDPlus) with MaxChannels() and UseSpaces() methods
@@ -99,9 +101,11 @@
   - AudioOutputLevelSwitch, RemotePairStatus, RemotePairAction, LinkTXStatus - SLX-D/SLX-D+ specific enums
   - AntennaSquelchStatus, TXMuteStatus, TXMuteButtonStatus, TXPowerSource, BatteryType, TXLock - Telemetry enums
   - NetworkInterface, IPMode - SLX-D+ Dante network enums
-- **public_functions**: 
+- **public_functions**:
   - NewShureController(addr string) ShureController - Factory for Shure controller (now implements real TCP/IP communication)
   - NewNMOSController(addr string) NMOSController - Factory for NMOS controller (auto-discovers registries, registers node, supports IS-07/IS-12)
+  - NewInMemorySQLiteDatabase() (Database, error) - Factory for in-memory SQLite database for state management
+  - NewSQLiteDatabase(path string) (Database, error) - Factory for SQLite database at specified path
   - NewInMemoryMessageBus() MessageBus - Factory for in-memory message bus
   - NewShureCommand(command string) *ShureCommandBuilder - Factory for command builder
   - NewShureCommandWithModel(command string, family ShureModelFamily) *ShureCommandBuilderWithModel - Factory for model-aware command builder

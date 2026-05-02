@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,7 +66,6 @@ func (c *ncpClient) SetReadDeadline(t time.Time) error {
 	return c.conn.SetReadDeadline(t)
 }
 
-// nmosController is the concrete implementation of NMOSController
 type nmosController struct {
 	registryURL    string
 	registryConfig RegistryDiscoveryConfig
@@ -77,7 +77,8 @@ type nmosController struct {
 	isRunning      bool
 	listenAddr     string
 	nodes          []interface{}
-	resources      map[string][]interface{}
+	db             Database
+	resources      map[string][]interface{} // Fallback in-memory map when db is nil
 	deviceControls map[string][]map[string]interface{}
 	eventsChan     chan interface{}
 	done           chan struct{}
@@ -122,6 +123,20 @@ type nmosController struct {
 	// IS-04 Registration state
 	registered   bool
 	registeredMu sync.RWMutex
+
+	// Network interfaces for IS-04 node self resource
+	nodeInterfaces []map[string]interface{}
+
+	// Registry monitoring state
+	monitoringRegistry  bool
+	registryMonitorMu   sync.RWMutex
+	currentRegistryURL  string
+
+	// Peer-to-peer mode version counters (for mDNS TXT records)
+	// These increment when resources change and wrap at 255
+	peerToPeerMu      sync.RWMutex
+	versionCounters   map[string]uint8 // resource type -> counter
+	peerToPeerMode    bool              // true when operating without registry
 }
 
 // NewNMOSController creates a new NMOSController instance with default DNS-SD/mDNS discovery
@@ -146,7 +161,8 @@ func NewNMOSControllerWithConfig(addr string, registryConfig RegistryDiscoveryCo
 		registryConfig:     registryConfig,
 		httpClient:         &http.Client{Timeout: 10 * time.Second},
 		heartbeatInterval:  5 * time.Second,
-		resources:          make(map[string][]interface{}),
+		db:                  nil, // Set via SetDatabase
+		resources:           make(map[string][]interface{}), // Fallback when db is nil
 		deviceControls:     make(map[string][]map[string]interface{}),
 		ncpObjects:         make(map[int]NcObject),
 		ncpClients:         make(map[*ncpClient]bool),
@@ -162,6 +178,7 @@ func NewNMOSControllerWithConfig(addr string, registryConfig RegistryDiscoveryCo
 		cancel:             cancel,
 		stagedConnections:  make(map[string]ConnectionStaged),
 		activeConnections:  make(map[string]ConnectionActive),
+		versionCounters:    map[string]uint8{"self": 0, "sources": 0, "flows": 0, "devices": 0, "senders": 0, "receivers": 0},
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -170,6 +187,9 @@ func NewNMOSControllerWithConfig(addr string, registryConfig RegistryDiscoveryCo
 			},
 		},
 	}
+
+	// Discover and cache network interfaces for IS-04 node self resource
+	ctrl.discoverNodeInterfaces()
 
 	// Register Root Block (OID 1)
 	rootBlock := NewNcBlock(1, nil, "Root", "Root Block")
@@ -251,40 +271,123 @@ func (c *nmosController) Start(ctx context.Context) error {
 
 // discoverAndRegister discovers NMOS registries via mDNS and registers this node
 func (c *nmosController) discoverAndRegister(ctx context.Context) {
-	// Try to discover registry via mDNS
-	registryURL, err := c.discoverRegistry(ctx)
-	if err != nil {
-		slog.Warn("Registry discovery failed, using default", "error", err)
+	c.registryMonitorMu.Lock()
+	c.monitoringRegistry = true
+	c.registryMonitorMu.Unlock()
+
+	registryURL := c.registryURL
+	if url, err := c.discoverRegistry(ctx); err == nil {
+		registryURL = url
+		c.registryURL = url
+		c.currentRegistryURL = url
+		slog.Info("Discovered NMOS registry", "url", registryURL)
 	} else {
-		c.registryURL = registryURL
+		slog.Warn("No registry found via mDNS, operating in peer-to-peer mode", "error", err)
+		c.currentRegistryURL = ""
 	}
 
-	// Build node resource using the persistent node ID
-	node := c.buildNodeResource(c.nodeID)
-
-	// Register with registry
-	if err := c.RegisterNode(node); err != nil {
-		slog.Warn("Failed to register node with registry", "error", err)
+	if registryURL == "" {
+		c.registryMonitorMu.Lock()
+		c.monitoringRegistry = false
+		c.registryMonitorMu.Unlock()
+		c.registeredMu.Lock()
+		c.registered = false
+		c.registeredMu.Unlock()
+		c.setPeerToPeerMode(true)
+		slog.Info("Node operating in peer-to-peer mode (no registry)")
 		return
 	}
 
-	// Mark as successfully registered
+	if err := c.registerWithRegistry(ctx, registryURL); err != nil {
+		slog.Warn("Failed to register node with registry, operating in peer-to-peer mode", "error", err)
+		c.registryMonitorMu.Lock()
+		c.monitoringRegistry = false
+		c.registryMonitorMu.Unlock()
+		c.registeredMu.Lock()
+		c.registered = false
+		c.registeredMu.Unlock()
+		c.setPeerToPeerMode(true)
+		return
+	}
+
 	c.registeredMu.Lock()
 	c.registered = true
 	c.registeredMu.Unlock()
+	c.setPeerToPeerMode(false)
 
-	// Signal that registration is complete
 	select {
-	case c.registryResolved <- c.registryURL:
+	case c.registryResolved <- registryURL:
 	default:
 	}
 
-	// Start heartbeating
+	slog.Info("Node registered with registry", "registry", registryURL)
+
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
 		c.startHeartbeat(ctx)
 	}()
+
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.monitorRegistry(ctx)
+	}()
+}
+
+// registerWithRegistry attempts to register the node with the given registry URL
+// and registers all resources (devices, sources, flows, senders, receivers)
+func (c *nmosController) registerWithRegistry(ctx context.Context, registryURL string) error {
+	node := c.buildNodeResource(c.nodeID)
+	c.registryURL = registryURL
+	c.currentRegistryURL = registryURL
+
+	if err := c.RegisterNode(node); err != nil {
+		return err
+	}
+
+	slog.Info("Node registered with registry", "registry", registryURL)
+
+	// Re-register all resources with the new registry
+	c.reRegisterAll(ctx)
+
+	return nil
+}
+
+// monitorRegistry continuously monitors for registry changes via mDNS and re-registers if needed
+func (c *nmosController) monitorRegistry(ctx context.Context) {
+	registryCheckTicker := time.NewTicker(30 * time.Second)
+	defer registryCheckTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.done:
+			return
+		case <-registryCheckTicker.C:
+			c.registryMonitorMu.RLock()
+			monitoring := c.monitoringRegistry
+			c.registryMonitorMu.RUnlock()
+
+			if !monitoring {
+				return
+			}
+
+			if newURL, err := c.discoverRegistry(ctx); err == nil {
+				c.registryMonitorMu.RLock()
+				currentURL := c.currentRegistryURL
+				c.registryMonitorMu.RUnlock()
+
+				if newURL != currentURL {
+					slog.Info("Registry changed, re-registering", "old", currentURL, "new", newURL)
+					if err := c.registerWithRegistry(ctx, newURL); err != nil {
+						slog.Error("Failed to re-register with new registry", "error", err)
+					}
+				}
+			}
+		}
+	}
 }
 
 // startHeartbeat manages the periodic heartbeat to the registration API
@@ -315,7 +418,8 @@ func (c *nmosController) performHeartbeat(ctx context.Context) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		slog.Warn("Heartbeat failed", "url", heartbeatURL, "error", err)
+		slog.Warn("Heartbeat failed, attempting registry re-discovery", "url", heartbeatURL, "error", err)
+		c.rediscoverAndReregister(ctx)
 		return
 	}
 	defer resp.Body.Close()
@@ -323,11 +427,34 @@ func (c *nmosController) performHeartbeat(ctx context.Context) {
 	switch resp.StatusCode {
 	case http.StatusOK:
 		slog.Debug("NMOS Heartbeat successful")
-	case http.StatusNotFound:
-		slog.Warn("NMOS Registry returned 404 for heartbeat, re-registering everything")
-		c.reRegisterAll(ctx)
+	case http.StatusNotFound, http.StatusGone:
+		slog.Warn("NMOS Registry returned error for heartbeat, re-registering with discovered registry")
+		c.rediscoverAndReregister(ctx)
 	default:
 		slog.Warn("NMOS Registry returned unexpected status for heartbeat", "status", resp.StatusCode)
+	}
+}
+
+// rediscoverAndReregister discovers a new registry via mDNS and re-registers
+func (c *nmosController) rediscoverAndReregister(ctx context.Context) {
+	c.registryMonitorMu.Lock()
+	c.monitoringRegistry = false
+	c.registryMonitorMu.Unlock()
+
+	newURL, err := c.discoverRegistry(ctx)
+	if err != nil {
+		slog.Warn("Registry re-discovery failed", "error", err)
+		return
+	}
+
+	c.registryMonitorMu.Lock()
+	c.currentRegistryURL = newURL
+	c.registryURL = newURL
+	c.monitoringRegistry = true
+	c.registryMonitorMu.Unlock()
+
+	if err := c.registerWithRegistry(ctx, newURL); err != nil {
+		slog.Error("Failed to re-register with new registry", "error", err)
 	}
 }
 
@@ -487,7 +614,6 @@ func (c *nmosController) unregisterResourceFromRegistry(ctx context.Context, res
 
 // unregisterAll performs a controlled unregistration of all resources in order
 func (c *nmosController) unregisterAll(ctx context.Context) {
-	// Check if we were ever successfully registered
 	c.registeredMu.RLock()
 	wasRegistered := c.registered
 	c.registeredMu.RUnlock()
@@ -499,34 +625,91 @@ func (c *nmosController) unregisterAll(ctx context.Context) {
 
 	slog.Info("Performing NMOS controlled unregistration")
 
-	// Order of deletion (reverse of registration): Receivers -> Senders -> Flows -> Sources -> Devices
-	resourceTypes := []string{"receivers", "senders", "flows", "sources", "devices"}
+	childTypes := []string{"receivers", "senders", "flows", "sources"}
 
 	c.mu.RLock()
 	nodeID := c.nodeID
-	// Copy resource IDs to avoid holding lock during network calls
-	allResourceIDs := make(map[string][]string)
-	for _, t := range resourceTypes {
+
+	type resourceInfo struct {
+		id       string
+		deviceID string
+		resType  string
+	}
+
+	deviceIDs := make(map[string]struct{})
+	var allResources []resourceInfo
+
+	for _, t := range childTypes {
 		for _, res := range c.resources[t] {
 			if resMap, ok := res.(map[string]interface{}); ok {
-				if id, ok := resMap["id"].(string); ok {
-					allResourceIDs[t] = append(allResourceIDs[t], id)
+				id, idOK := resMap["id"].(string)
+				deviceID, devOK := resMap["device_id"].(string)
+				if idOK && devOK {
+					deviceIDs[deviceID] = struct{}{}
+					allResources = append(allResources, resourceInfo{id: id, deviceID: deviceID, resType: t})
 				}
 			}
 		}
 	}
+
+	devices := make([]string, 0, len(deviceIDs))
+	for d := range deviceIDs {
+		devices = append(devices, d)
+	}
 	c.mu.RUnlock()
 
-	for _, resourceType := range resourceTypes {
-		for _, id := range allResourceIDs[resourceType] {
-			if err := c.unregisterResourceFromRegistry(ctx, resourceType, id); err != nil {
-				slog.Warn("Failed to unregister resource", "type", resourceType, "id", id, "error", err)
+	sort.Strings(devices)
+	const maxConcurrent = 4
+
+	for _, deviceID := range devices {
+		deviceResources := make([]resourceInfo, 0)
+		for _, r := range allResources {
+			if r.deviceID == deviceID {
+				deviceResources = append(deviceResources, r)
+			}
+		}
+
+		if len(deviceResources) == 0 {
+			continue
+		}
+
+		sem := make(chan struct{}, maxConcurrent)
+		var wg sync.WaitGroup
+		errChan := make(chan error, len(deviceResources))
+
+		for _, r := range deviceResources {
+			wg.Add(1)
+			go func(rid, rt string) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				unregCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+				defer cancel()
+
+				if err := c.unregisterResourceFromRegistry(unregCtx, rt, rid); err != nil {
+					errChan <- fmt.Errorf("%s/%s: %w", rt, rid, err)
+				}
+			}(r.id, r.resType)
+		}
+
+		wg.Wait()
+		close(errChan)
+
+		for err := range errChan {
+			slog.Warn("Failed to unregister resource", "error", err)
+		}
+
+		{
+			unregCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+			if err := c.unregisterResourceFromRegistry(unregCtx, "devices", deviceID); err != nil {
+				slog.Warn("Failed to unregister device", "id", deviceID, "error", err)
 			}
 		}
 	}
 
-	// Finally, unregister the Node itself
-	if err := c.unregisterResourceFromRegistry(ctx, "node", nodeID); err != nil {
+	if err := c.unregisterResourceFromRegistry(context.Background(), "node", nodeID); err != nil {
 		slog.Warn("Failed to unregister node", "id", nodeID, "error", err)
 	}
 }
@@ -607,9 +790,12 @@ func (c *nmosController) discoverMDNS(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("failed to browse for registry via mDNS: %w", err)
 	}
 
+	discoveryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	select {
-	case <-ctx.Done():
-		return "", ctx.Err()
+	case <-discoveryCtx.Done():
+		return "", errors.New("mDNS registry discovery timed out")
 	case <-done:
 		return "", errors.New("no registries found via mDNS")
 	case entry := <-entries:
@@ -684,9 +870,15 @@ func (c *nmosController) buildNodeResource(nodeID string) map[string]interface{}
 				{"host": host, "port": port, "protocol": "http"},
 			},
 		},
-		"hostname":   hostname,
-		"interfaces": []interface{}{},
-		"clocks":     []interface{}{},
+"hostname": hostname,
+		"interfaces": c.nodeInterfaces,
+		"services":  []map[string]interface{}{},
+		"clocks": []map[string]interface{}{
+			{
+				"name":     "clk0",
+				"ref_type": "internal",
+			},
+		},
 	}
 }
 
@@ -696,6 +888,62 @@ func splitHostPort(addr string) (host, port string) {
 		return addr[:idx], addr[idx+1:]
 	}
 	return addr, ""
+}
+
+// discoverNodeInterfaces discovers and caches network interface information for IS-04 node self resource
+func (c *nmosController) discoverNodeInterfaces() {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		slog.Warn("Failed to discover network interfaces", "error", err)
+		c.nodeInterfaces = []map[string]interface{}{
+			{"name": "eth0", "port": 8080, "mac": "00:00:00:00:00:00", "enabled": true, "mtu": 1500, "type": "ethernet", "primary": true},
+		}
+		return
+	}
+
+	var primaryInterface *net.Interface
+
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil || len(addrs) == 0 {
+			continue
+		}
+		for _, addr := range addrs {
+			if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.To4() != nil && !ipNet.IP.IsLoopback() {
+				primaryInterface = &iface
+				break
+			}
+		}
+		if primaryInterface != nil {
+			break
+		}
+	}
+
+	if primaryInterface == nil {
+		slog.Warn("No suitable network interface found, using default")
+		c.nodeInterfaces = []map[string]interface{}{
+			{
+				"name":       "eth0",
+				"chassis_id": nil,
+				"port_id":    "00:00:00:00:00:00",
+			},
+		}
+		return
+	}
+
+	macStr := primaryInterface.HardwareAddr.String()
+	c.nodeInterfaces = []map[string]interface{}{
+		{
+			"name":       primaryInterface.Name,
+			"chassis_id": nil,
+			"port_id":    macStr,
+		},
+	}
+
+	slog.Info("Discovered network interface", "name", primaryInterface.Name, "mac", macStr)
 }
 
 // startServer initializes and starts the NMOS Node API HTTP server
@@ -732,12 +980,18 @@ func (c *nmosController) setupRouter() *chi.Mux {
 	r.Use(middleware.Recoverer)
 	r.Use(corsMiddleware)
 
+	r.Get("/x-nmos", c.handleNodeRoot)
+	r.Get("/x-nmos/", c.handleNodeRoot)
+	r.Get("/x-nmos/node", c.handleNodeRoot)
+	r.Get("/x-nmos/node/", c.handleNodeRoot)
 	r.Get("/x-nmos/node/v1.3", c.handleNodeRoot)
 	r.Get("/x-nmos/node/v1.3/", c.handleNodeRoot)
 	r.Get("/x-nmos/node/v1.3/self", c.handleNodeSelf)
 	r.Get("/x-nmos/node/v1.3/self/", c.handleNodeSelf)
 	r.Get("/x-nmos/node/v1.3/devices", c.handleNodeDevices)
 	r.Get("/x-nmos/node/v1.3/devices/", c.handleNodeDevices)
+	r.Get("/x-nmos/node/v1.3/devices/{id}", c.handleNodeDeviceById)
+	r.Get("/x-nmos/node/v1.3/devices/{id}/", c.handleNodeDeviceById)
 	r.Route("/x-nmos/node/v1.3/devices/{id}/controls", func(r chi.Router) {
 		r.Get("/", c.handleDeviceControls)
 		r.Post("/", c.handleDeviceControls)
@@ -746,12 +1000,20 @@ func (c *nmosController) setupRouter() *chi.Mux {
 	})
 	r.Get("/x-nmos/node/v1.3/sources", c.handleNodeSources)
 	r.Get("/x-nmos/node/v1.3/sources/", c.handleNodeSources)
+	r.Get("/x-nmos/node/v1.3/sources/{id}", c.handleNodeSourceById)
+	r.Get("/x-nmos/node/v1.3/sources/{id}/", c.handleNodeSourceById)
 	r.Get("/x-nmos/node/v1.3/flows", c.handleNodeFlows)
 	r.Get("/x-nmos/node/v1.3/flows/", c.handleNodeFlows)
+	r.Get("/x-nmos/node/v1.3/flows/{id}", c.handleNodeFlowById)
+	r.Get("/x-nmos/node/v1.3/flows/{id}/", c.handleNodeFlowById)
 	r.Get("/x-nmos/node/v1.3/senders", c.handleNodeSenders)
 	r.Get("/x-nmos/node/v1.3/senders/", c.handleNodeSenders)
+	r.Get("/x-nmos/node/v1.3/senders/{id}", c.handleNodeSenderById)
+	r.Get("/x-nmos/node/v1.3/senders/{id}/", c.handleNodeSenderById)
 	r.Get("/x-nmos/node/v1.3/receivers", c.handleNodeReceivers)
 	r.Get("/x-nmos/node/v1.3/receivers/", c.handleNodeReceivers)
+	r.Get("/x-nmos/node/v1.3/receivers/{id}", c.handleNodeReceiverById)
+	r.Get("/x-nmos/node/v1.3/receivers/{id}/", c.handleNodeReceiverById)
 
 	r.Get("/x-nmos/node/v1.3/ncp", c.handleNCP)
 	r.Get("/x-nmos/node/v1.3/ncp/", c.handleNCP)
@@ -786,7 +1048,16 @@ func (c *nmosController) setupRouter() *chi.Mux {
 		})
 	})
 
+	r.NotFound(c.handleNotFound)
+
 	return r
+}
+
+// handleNotFound returns a JSON error response for unhandled routes
+func (c *nmosController) handleNotFound(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	json.NewEncoder(w).Encode(map[string]string{"error": "Not Found"})
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
@@ -870,6 +1141,59 @@ func (c *nmosController) startMDNS() error {
 
 	slog.Info("NMOS services advertised via mDNS", "host", host, "port", port)
 	return nil
+}
+
+// incrementAndGetVersion increments the peer-to-peer version counter for a resource type
+// and returns the new value (wraps at 255)
+func (c *nmosController) incrementAndGetVersion(resourceType string) uint8 {
+	c.peerToPeerMu.Lock()
+	defer c.peerToPeerMu.Unlock()
+	count := c.versionCounters[resourceType]
+	if count == 255 {
+		count = 0
+	} else {
+		count++
+	}
+	c.versionCounters[resourceType] = count
+	slog.Info("Peer-to-peer version updated", "resource", resourceType, "version", count)
+	return count
+}
+
+// updatePeerToPeerMDNS logs the current peer-to-peer version counters
+// Note: The zeroconf library v1.0.0 doesn't support dynamic TXT record updates,
+// so we just log the current state for debugging purposes
+func (c *nmosController) updatePeerToPeerMDNS() {
+	if !c.peerToPeerMode {
+		return
+	}
+
+	c.peerToPeerMu.RLock()
+	verSlf := c.versionCounters["self"]
+	verSrc := c.versionCounters["sources"]
+	verFlw := c.versionCounters["flows"]
+	verDvc := c.versionCounters["devices"]
+	verSnd := c.versionCounters["senders"]
+	verRcv := c.versionCounters["receivers"]
+	c.peerToPeerMu.RUnlock()
+
+	slog.Info("Peer-to-peer version state",
+		"ver_slf", verSlf,
+		"ver_src", verSrc,
+		"ver_flw", verFlw,
+		"ver_dvc", verDvc,
+		"ver_snd", verSnd,
+		"ver_rcv", verRcv)
+}
+
+// setPeerToPeerMode enables or disables peer-to-peer mode
+func (c *nmosController) setPeerToPeerMode(enabled bool) {
+	c.peerToPeerMode = enabled
+	if enabled {
+		slog.Info("Switched to peer-to-peer mode, version TXT records will be tracked")
+		c.updatePeerToPeerMDNS()
+	} else {
+		slog.Info("Exiting peer-to-peer mode, registry mode active")
+	}
 }
 
 // BroadcastNCPNotification sends a notification to subscribed NCP clients only
@@ -1197,19 +1521,29 @@ func (c *nmosController) Stop(ctx context.Context) error {
 
 // handleNodeRoot handles the root of the Node API
 func (c *nmosController) handleNodeRoot(w http.ResponseWriter, r *http.Request) {
-	endpoints := []string{
+	path := r.URL.Path
+
+	if path == "/x-nmos" || path == "/x-nmos/" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]string{"node/"})
+		return
+	}
+
+	if path == "/x-nmos/node" || path == "/x-nmos/node/" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]string{"v1.3/"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode([]string{
 		"self/",
-		"devices/",
 		"sources/",
 		"flows/",
+		"devices/",
 		"senders/",
 		"receivers/",
-		"ncp/",
-	}
-	// Note: In a full NMOS implementation, /events would be discovered via mDNS
-	// or documented at the root level if using a unified API
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(endpoints)
+	})
 }
 
 func (c *nmosController) handleEventsRoot(w http.ResponseWriter, r *http.Request) {
@@ -1594,7 +1928,11 @@ func (c *nmosController) handleNodeSelf(w http.ResponseWriter, r *http.Request) 
 		port = p
 	}
 
-	// Self representation
+	hostname := host
+	if c.advertisedAddr != "" {
+		hostname = c.advertisedAddr
+	}
+
 	self := map[string]interface{}{
 		"id":          c.nodeID,
 		"version":     fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond()),
@@ -1602,10 +1940,22 @@ func (c *nmosController) handleNodeSelf(w http.ResponseWriter, r *http.Request) 
 		"description": "Gateway connecting Shure Axient to NMOS",
 		"tags":        map[string]interface{}{},
 		"caps":        map[string]interface{}{},
-		"api":         map[string]interface{}{"versions": []string{"v1.3"}, "endpoints": []map[string]interface{}{{"host": host, "port": port, "protocol": "http"}}},
-		"hostname":    host,
-		"interfaces":  []interface{}{},
-		"clocks":      []interface{}{},
+		"href":        fmt.Sprintf("http://%s:%d/", host, port),
+		"api": map[string]interface{}{
+			"versions": []string{"v1.3"},
+			"endpoints": []map[string]interface{}{
+				{"host": host, "port": port, "protocol": "http"},
+			},
+		},
+		"hostname":   hostname,
+		"interfaces": c.nodeInterfaces,
+		"services":   []map[string]interface{}{},
+		"clocks": []map[string]interface{}{
+			{
+				"name":     "clk0",
+				"ref_type": "internal",
+			},
+		},
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(self)
@@ -1614,41 +1964,368 @@ func (c *nmosController) handleNodeSelf(w http.ResponseWriter, r *http.Request) 
 // handleNodeDevices handles the /devices endpoint
 func (c *nmosController) handleNodeDevices(w http.ResponseWriter, r *http.Request) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	db := c.db
+	c.mu.RUnlock()
+
 	w.Header().Set("Content-Type", "application/json")
+
+	if db != nil {
+		devices, err := db.GetDevices()
+		if err != nil {
+			slog.Error("Failed to get devices from database", "error", err)
+			json.NewEncoder(w).Encode([]interface{}{})
+			return
+		}
+		// Convert to generic interface slice for compatibility
+		result := make([]interface{}, len(devices))
+		for i, d := range devices {
+			result[i] = d
+		}
+		json.NewEncoder(w).Encode(result)
+		return
+	}
+
+	// Fallback to in-memory if db not set
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.resources == nil || c.resources["devices"] == nil {
+		json.NewEncoder(w).Encode([]interface{}{})
+		return
+	}
 	json.NewEncoder(w).Encode(c.resources["devices"])
 }
 
 // handleNodeSources handles the /sources endpoint
 func (c *nmosController) handleNodeSources(w http.ResponseWriter, r *http.Request) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	db := c.db
+	c.mu.RUnlock()
+
 	w.Header().Set("Content-Type", "application/json")
+
+	if db != nil {
+		sources, err := db.GetSources()
+		if err != nil {
+			slog.Error("Failed to get sources from database", "error", err)
+			json.NewEncoder(w).Encode([]interface{}{})
+			return
+		}
+		result := make([]interface{}, len(sources))
+		for i, s := range sources {
+			result[i] = s
+		}
+		json.NewEncoder(w).Encode(result)
+		return
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.resources == nil || c.resources["sources"] == nil {
+		json.NewEncoder(w).Encode([]interface{}{})
+		return
+	}
 	json.NewEncoder(w).Encode(c.resources["sources"])
 }
 
 // handleNodeFlows handles the /flows endpoint
 func (c *nmosController) handleNodeFlows(w http.ResponseWriter, r *http.Request) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	db := c.db
+	c.mu.RUnlock()
+
 	w.Header().Set("Content-Type", "application/json")
+
+	if db != nil {
+		flows, err := db.GetFlows()
+		if err != nil {
+			slog.Error("Failed to get flows from database", "error", err)
+			json.NewEncoder(w).Encode([]interface{}{})
+			return
+		}
+		result := make([]interface{}, len(flows))
+		for i, f := range flows {
+			result[i] = f
+		}
+		json.NewEncoder(w).Encode(result)
+		return
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.resources == nil || c.resources["flows"] == nil {
+		json.NewEncoder(w).Encode([]interface{}{})
+		return
+	}
 	json.NewEncoder(w).Encode(c.resources["flows"])
 }
 
 // handleNodeSenders handles the /senders endpoint
 func (c *nmosController) handleNodeSenders(w http.ResponseWriter, r *http.Request) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	db := c.db
+	c.mu.RUnlock()
+
 	w.Header().Set("Content-Type", "application/json")
+
+	if db != nil {
+		senders, err := db.GetSenders()
+		if err != nil {
+			slog.Error("Failed to get senders from database", "error", err)
+			json.NewEncoder(w).Encode([]interface{}{})
+			return
+		}
+		result := make([]interface{}, len(senders))
+		for i, s := range senders {
+			result[i] = s
+		}
+		json.NewEncoder(w).Encode(result)
+		return
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.resources == nil || c.resources["senders"] == nil {
+		json.NewEncoder(w).Encode([]interface{}{})
+		return
+	}
 	json.NewEncoder(w).Encode(c.resources["senders"])
 }
 
 // handleNodeReceivers handles the /receivers endpoint
 func (c *nmosController) handleNodeReceivers(w http.ResponseWriter, r *http.Request) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	db := c.db
+	c.mu.RUnlock()
+
 	w.Header().Set("Content-Type", "application/json")
+
+	if db != nil {
+		receivers, err := db.GetReceivers()
+		if err != nil {
+			slog.Error("Failed to get receivers from database", "error", err)
+			json.NewEncoder(w).Encode([]interface{}{})
+			return
+		}
+		result := make([]interface{}, len(receivers))
+		for i, r := range receivers {
+			result[i] = r
+		}
+		json.NewEncoder(w).Encode(result)
+		return
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.resources == nil || c.resources["receivers"] == nil {
+		json.NewEncoder(w).Encode([]interface{}{})
+		return
+	}
 	json.NewEncoder(w).Encode(c.resources["receivers"])
+}
+
+// handleNodeDeviceById handles GET /devices/{id}
+func (c *nmosController) handleNodeDeviceById(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	c.mu.RLock()
+	db := c.db
+	c.mu.RUnlock()
+
+	if db != nil {
+		device, err := db.GetDevice(id)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		if device == nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(device)
+		return
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.resources == nil || c.resources["devices"] == nil {
+		http.NotFound(w, r)
+		return
+	}
+	for _, d := range c.resources["devices"] {
+		if dev, ok := d.(map[string]interface{}); ok {
+			if dev["id"] == id {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(dev)
+				return
+			}
+		}
+	}
+	http.NotFound(w, r)
+}
+
+// handleNodeSourceById handles GET /sources/{id}
+func (c *nmosController) handleNodeSourceById(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	c.mu.RLock()
+	db := c.db
+	c.mu.RUnlock()
+
+	if db != nil {
+		source, err := db.GetSource(id)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		if source == nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(source)
+		return
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.resources == nil || c.resources["sources"] == nil {
+		http.NotFound(w, r)
+		return
+	}
+	for _, s := range c.resources["sources"] {
+		if src, ok := s.(map[string]interface{}); ok {
+			if src["id"] == id {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(src)
+				return
+			}
+		}
+	}
+	http.NotFound(w, r)
+}
+
+// handleNodeFlowById handles GET /flows/{id}
+func (c *nmosController) handleNodeFlowById(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	c.mu.RLock()
+	db := c.db
+	c.mu.RUnlock()
+
+	if db != nil {
+		flow, err := db.GetFlow(id)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		if flow == nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(flow)
+		return
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.resources == nil || c.resources["flows"] == nil {
+		http.NotFound(w, r)
+		return
+	}
+	for _, f := range c.resources["flows"] {
+		if fl, ok := f.(map[string]interface{}); ok {
+			if fl["id"] == id {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(fl)
+				return
+			}
+		}
+	}
+	http.NotFound(w, r)
+}
+
+// handleNodeSenderById handles GET /senders/{id}
+func (c *nmosController) handleNodeSenderById(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	c.mu.RLock()
+	db := c.db
+	c.mu.RUnlock()
+
+	if db != nil {
+		sender, err := db.GetSender(id)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		if sender == nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(sender)
+		return
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.resources == nil || c.resources["senders"] == nil {
+		http.NotFound(w, r)
+		return
+	}
+	for _, s := range c.resources["senders"] {
+		if sndr, ok := s.(map[string]interface{}); ok {
+			if sndr["id"] == id {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(sndr)
+				return
+			}
+		}
+	}
+	http.NotFound(w, r)
+}
+
+// handleNodeReceiverById handles GET /receivers/{id}
+func (c *nmosController) handleNodeReceiverById(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	c.mu.RLock()
+	db := c.db
+	c.mu.RUnlock()
+
+	if db != nil {
+		receiver, err := db.GetReceiver(id)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		if receiver == nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(receiver)
+		return
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.resources == nil || c.resources["receivers"] == nil {
+		http.NotFound(w, r)
+		return
+	}
+	for _, rcv := range c.resources["receivers"] {
+		if r, ok := rcv.(map[string]interface{}); ok {
+			if r["id"] == id {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(r)
+				return
+			}
+		}
+	}
+	http.NotFound(w, r)
 }
 
 // handleDeviceControls handles the /devices/{id}/controls/ endpoint
@@ -1747,82 +2424,181 @@ func (c *nmosController) GetControls(deviceID string) []map[string]interface{} {
 func (c *nmosController) RegisterResource(resourceType string, resource interface{}) error {
 	resourceType = c.toPlural(resourceType)
 	c.mu.Lock()
+	db := c.db
+	c.mu.Unlock()
 
 	// If it's a map with an ID, check if it already exists
 	if resMap, ok := resource.(map[string]interface{}); ok {
 		if id, ok := resMap["id"].(string); ok {
-			// Check for updates
-			updated := false
-			for i, r := range c.resources[resourceType] {
-				if rMap, ok := r.(map[string]interface{}); ok {
-					if rMap["id"] == id {
-						c.resources[resourceType][i] = resource
-						slog.Debug("Updated NMOS resource", "type", resourceType, "id", id)
-						updated = true
-						break
+			// Try database first
+			if db != nil {
+				switch resourceType {
+				case "devices":
+					dev := Device{
+						ID:          id,
+						Version:     getStringField(resMap, "version"),
+						Label:       getStringField(resMap, "label"),
+						Description: getStringField(resMap, "description"),
+						NodeID:      getStringField(resMap, "node_id"),
+						Tags:        getMapField(resMap, "tags"),
+						Senders:     getStringSliceField(resMap, "senders"),
+						Receivers:   getStringSliceField(resMap, "receivers"),
+						Controls:    getInterfaceSliceField(resMap, "controls"),
+					}
+					if err := db.UpsertDevice(dev); err != nil {
+						slog.Error("Failed to upsert device to database", "id", id, "error", err)
+					}
+				case "sources":
+					src := Source{
+						ID:          id,
+						Version:     getStringField(resMap, "version"),
+						Label:       getStringField(resMap, "label"),
+						Description: getStringField(resMap, "description"),
+						Format:      getStringField(resMap, "format"),
+						DeviceID:    getStringField(resMap, "device_id"),
+						EventType:   getStringField(resMap, "event_type"),
+						Tags:        getMapField(resMap, "tags"),
+						GrainRate:   getIntMapField(resMap, "grain_rate"),
+					}
+					if err := db.UpsertSource(src); err != nil {
+						slog.Error("Failed to upsert source to database", "id", id, "error", err)
+					}
+				case "flows":
+					fl := Flow{
+						ID:          id,
+						Version:     getStringField(resMap, "version"),
+						Label:       getStringField(resMap, "label"),
+						Description: getStringField(resMap, "description"),
+						Format:      getStringField(resMap, "format"),
+						SourceID:    getStringField(resMap, "source_id"),
+						DeviceID:    getStringField(resMap, "device_id"),
+						Parents:     getStringSliceField(resMap, "parents"),
+						Tags:        getMapField(resMap, "tags"),
+						MediaType:   getStringField(resMap, "media_type"),
+						EventType:   getStringField(resMap, "event_type"),
+						GrainRate:   getIntMapField(resMap, "grain_rate"),
+					}
+					if err := db.UpsertFlow(fl); err != nil {
+						slog.Error("Failed to upsert flow to database", "id", id, "error", err)
+					}
+				case "senders":
+					sndr := Sender{
+						ID:                 id,
+						Version:            getStringField(resMap, "version"),
+						Label:              getStringField(resMap, "label"),
+						Description:        getStringField(resMap, "description"),
+						DeviceID:           getStringField(resMap, "device_id"),
+						FlowID:             getStringField(resMap, "flow_id"),
+						Transport:          getStringField(resMap, "transport"),
+						InterfaceBindings:  getStringSliceField(resMap, "interface_bindings"),
+						Tags:               getMapField(resMap, "tags"),
+						TransportParams:    getMapSliceField(resMap, "transport_params"),
+					}
+					if err := db.UpsertSender(sndr); err != nil {
+						slog.Error("Failed to upsert sender to database", "id", id, "error", err)
+					}
+				case "receivers":
+					rcv := Receiver{
+						ID:                 id,
+						Version:            getStringField(resMap, "version"),
+						Label:              getStringField(resMap, "label"),
+						Description:        getStringField(resMap, "description"),
+						DeviceID:           getStringField(resMap, "device_id"),
+						Transport:          getStringField(resMap, "transport"),
+						InterfaceBindings:  getStringSliceField(resMap, "interface_bindings"),
+						Tags:               getMapField(resMap, "tags"),
+						TransportParams:    getMapSliceField(resMap, "transport_params"),
+					}
+					if err := db.UpsertReceiver(rcv); err != nil {
+						slog.Error("Failed to upsert receiver to database", "id", id, "error", err)
 					}
 				}
 			}
 
-			if !updated {
-				c.resources[resourceType] = append(c.resources[resourceType], resource)
-				slog.Info("Registered NMOS resource", "type", resourceType)
-			}
+			// Also update in-memory if using fallback
+			if db == nil || c.resources != nil {
+				c.mu.Lock()
+				defer c.mu.Unlock()
 
-			// Auto-update parent Device's senders/receivers list
-			if resourceType == "senders" || resourceType == "receivers" {
-				if deviceID, ok := resMap["device_id"].(string); ok {
-					for i, d := range c.resources["devices"] {
-						if dMap, ok := d.(map[string]interface{}); ok {
-							if dMap["id"] == deviceID {
-								// Found parent device, update list
-								listKey := resourceType // "senders" or "receivers"
+				// Check for updates
+				updated := false
+				for i, r := range c.resources[resourceType] {
+					if rMap, ok := r.(map[string]interface{}); ok {
+						if rMap["id"] == id {
+							c.resources[resourceType][i] = resource
+							slog.Debug("Updated NMOS resource", "type", resourceType, "id", id)
+							updated = true
+							break
+						}
+					}
+				}
 
-								// Create list if missing
-								if _, ok := dMap[listKey]; !ok {
-									dMap[listKey] = []string{}
-								}
+				if !updated {
+					c.resources[resourceType] = append(c.resources[resourceType], resource)
+					slog.Info("Registered NMOS resource", "type", resourceType)
+				}
 
-								// Check if ID already in list
-								list, _ := dMap[listKey].([]string) // Type assertion might fail if it was []interface{}, need care
+				// Auto-update parent Device's senders/receivers list
+				if resourceType == "senders" || resourceType == "receivers" {
+					if deviceID, ok := resMap["device_id"].(string); ok {
+						for i, d := range c.resources["devices"] {
+							if dMap, ok := d.(map[string]interface{}); ok {
+								if dMap["id"] == deviceID {
+									// Found parent device, update list
+									listKey := resourceType // "senders" or "receivers"
 
-								// Handle potential type mismatch if initialized as []interface{}
-								if list == nil {
-									if interfaceList, ok := dMap[listKey].([]interface{}); ok {
-										for _, item := range interfaceList {
-											if s, ok := item.(string); ok {
-												list = append(list, s)
+									// Create list if missing
+									if _, ok := dMap[listKey]; !ok {
+										dMap[listKey] = []string{}
+									}
+
+									// Check if ID already in list
+									list, _ := dMap[listKey].([]string) // Type assertion might fail if it was []interface{}, need care
+
+									// Handle potential type mismatch if initialized as []interface{}
+									if list == nil {
+										if interfaceList, ok := dMap[listKey].([]interface{}); ok {
+											for _, item := range interfaceList {
+												if s, ok := item.(string); ok {
+													list = append(list, s)
+												}
 											}
 										}
 									}
-								}
 
-								exists := false
-								for _, existingID := range list {
-									if existingID == id {
-										exists = true
-										break
+									exists := false
+									for _, existingID := range list {
+										if existingID == id {
+											exists = true
+											break
+										}
 									}
-								}
 
-								if !exists {
-									list = append(list, id)
-									dMap[listKey] = list
-									c.resources["devices"][i] = dMap // Save back
+									if !exists {
+										list = append(list, id)
+										dMap[listKey] = list
+										c.resources["devices"][i] = dMap // Save back
 
-									// Notify registry of device update
-									// We do this in a goroutine to avoid blocking/deadlock if registerResourceToRegistry calls back
-									go c.registerResourceToRegistry(c.ctx, "devices", dMap)
+										// Notify registry of device update
+										// We do this in a goroutine to avoid blocking/deadlock if registerResourceToRegistry calls back
+										go c.registerResourceToRegistry(c.ctx, "devices", dMap)
+									}
+									break
 								}
-								break
 							}
 						}
 					}
 				}
 			}
 
-			c.mu.Unlock()
 			c.broadcastUpdate(resourceType, resource)
+
+			// Update peer-to-peer version counter and mDNS TXT records if in peer-to-peer mode
+			if c.peerToPeerMode {
+				c.incrementAndGetVersion(resourceType)
+				c.updatePeerToPeerMDNS()
+			}
+
 			// Deep copy resource before passing to registry to avoid concurrent map access
 			resourceCopy, err := deepcopy(resource)
 			if err != nil {
@@ -1874,6 +2650,70 @@ func (c *nmosController) UpdateResource(resourceType string, id string, updateFn
 
 	c.broadcastUpdate(resourceType, updated)
 	return nil
+}
+
+// UpdateResourceInRegistry sends a PATCH request to update a resource in the NMOS registry
+func (c *nmosController) UpdateResourceInRegistry(resourceType string, id string, updateFn func(interface{}) interface{}) error {
+	resourceType = c.toPlural(resourceType)
+
+	c.mu.Lock()
+	var resourceIndex int
+	var found bool
+	for i, r := range c.resources[resourceType] {
+		if rMap, ok := r.(map[string]interface{}); ok {
+			if rMap["id"] == id {
+				resourceIndex = i
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		c.mu.Unlock()
+		return fmt.Errorf("resource not found: %s/%s", resourceType, id)
+	}
+
+	original := c.resources[resourceType][resourceIndex]
+	c.mu.Unlock()
+
+	updated := updateFn(original)
+
+	c.mu.Lock()
+	c.resources[resourceType][resourceIndex] = updated
+	c.mu.Unlock()
+
+	c.broadcastUpdate(resourceType, updated)
+
+	wrapper := map[string]interface{}{
+		"type": c.toSingular(resourceType),
+		"data": updated,
+	}
+
+	resourceJSON, err := json.Marshal(wrapper)
+	if err != nil {
+		return fmt.Errorf("failed to marshal resource: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/x-nmos/registration/v1.3/resource/%s/%s", c.registryURL, resourceType, id)
+	req, err := http.NewRequestWithContext(context.Background(), "PATCH", url, bytes.NewReader(resourceJSON))
+	if err != nil {
+		return fmt.Errorf("failed to create registry request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to update resource in registry: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		slog.Info("Updated resource in registry", "type", resourceType, "id", id)
+		return nil
+	}
+
+	respBody, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("registry rejected resource update: status %d, body: %s", resp.StatusCode, string(respBody))
 }
 
 // RegisterNode registers a node with the NMOS IS-04 registry
@@ -1974,6 +2814,30 @@ func (c *nmosController) GetListenAddr() string {
 // SetAdvertisedAddr sets the externally reachable address for NMOS hrefs
 func (c *nmosController) SetAdvertisedAddr(addr string) {
 	c.advertisedAddr = addr
+}
+
+// SetDatabase sets the database for state storage
+func (c *nmosController) SetDatabase(db Database) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.db = db
+}
+
+// GetDatabase returns the current database
+func (c *nmosController) GetDatabase() Database {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.db
+}
+
+// GetPrimaryInterfaceName returns the name of the primary network interface
+func (c *nmosController) GetPrimaryInterfaceName() string {
+	if len(c.nodeInterfaces) > 0 {
+		if name, ok := c.nodeInterfaces[0]["name"].(string); ok {
+			return name
+		}
+	}
+	return "eth0"
 }
 
 // listenForEvents listens for NMOS IS-05 events from the registry
@@ -2210,6 +3074,66 @@ func (c *nmosController) handleConnectionSenderConstraints(w http.ResponseWriter
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode([]interface{}{})
+}
+
+func getStringField(m map[string]interface{}, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func getMapField(m map[string]interface{}, key string) map[string]interface{} {
+	if v, ok := m[key].(map[string]interface{}); ok {
+		return v
+	}
+	return nil
+}
+
+func getStringSliceField(m map[string]interface{}, key string) []string {
+	if v, ok := m[key].([]string); ok {
+		return v
+	}
+	if v, ok := m[key].([]interface{}); ok {
+		result := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				result = append(result, s)
+			}
+		}
+		return result
+	}
+	return nil
+}
+
+func getInterfaceSliceField(m map[string]interface{}, key string) []interface{} {
+	if v, ok := m[key].([]interface{}); ok {
+		return v
+	}
+	return nil
+}
+
+func getIntMapField(m map[string]interface{}, key string) map[string]int {
+	if v, ok := m[key].(map[string]int); ok {
+		return v
+	}
+	if v, ok := m[key].(map[string]interface{}); ok {
+		result := make(map[string]int)
+		for k, val := range v {
+			if i, ok := val.(int); ok {
+				result[k] = i
+			}
+		}
+		return result
+	}
+	return nil
+}
+
+func getMapSliceField(m map[string]interface{}, key string) []map[string]interface{} {
+	if v, ok := m[key].([]map[string]interface{}); ok {
+		return v
+	}
+	return nil
 }
 
 // deepcopy creates a deep copy using reflection

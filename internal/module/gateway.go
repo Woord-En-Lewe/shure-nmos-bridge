@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/Woord-En-Lewe/shure-nmos-bridge/internal/infrastructure"
-	"github.com/google/uuid"
 )
 
 // Gateway defines the interface for the Shure-NMOS gateway
@@ -44,6 +43,7 @@ type gatewayImpl struct {
 	shureCtrls     map[string]*shureDeviceInfo
 	nmosCtrl       infrastructure.NMOSController
 	messageBus     infrastructure.MessageBus
+	db             infrastructure.Database
 	discoverer     *infrastructure.ShureDiscoverer
 	mu             sync.RWMutex
 }
@@ -66,10 +66,20 @@ func (g *gatewayImpl) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to create message bus")
 	}
 
+	// Create in-memory SQLite database
+	var err error
+	g.db, err = infrastructure.NewInMemorySQLiteDatabase()
+	if err != nil {
+		return fmt.Errorf("failed to create database: %w", err)
+	}
+
 	g.nmosCtrl = infrastructure.NewNMOSControllerWithConfig(g.nmosAddr, g.registryConfig)
 	if g.nmosCtrl == nil {
 		return fmt.Errorf("failed to create nmos controller")
 	}
+
+	// Set database on NMOS controller
+	g.nmosCtrl.SetDatabase(g.db)
 
 	// Discover and set externally reachable address for NMOS hrefs
 	if localIP := discoverLocalIP(); localIP != "" {
@@ -169,7 +179,7 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		return
 	}
 
-	deviceID := uuid.New().String()
+	deviceID := infrastructure.DeriveUUID(fmt.Sprintf("device-%s", addr))
 	deviceIndex := len(g.shureCtrls) + 1
 	deviceOID := 100 + deviceIndex*10
 
@@ -277,6 +287,26 @@ func (g *gatewayImpl) addShureController(ctx context.Context, addr string, dev i
 		g.shureCtrls[addr].senderIDs[i] = make(map[string]string)
 		// Eagerly register IS-07 resources for all SAMPLE metered parameters
 		g.ensureIS07ResourcesForChannel(g.shureCtrls[addr], i, deviceID, dev.Instance)
+	}
+
+	// Store Shure device in database for persistence and cross-component access
+	if g.db != nil {
+		shureDev := infrastructure.ShureDevice{
+			Address:         addr,
+			DeviceID:       deviceID,
+			DeviceOID:      deviceOID,
+			DeviceInstance: dev.Instance,
+			ModelFamily:    string(family),
+			LastSeen:       time.Now(),
+			ParameterOIDs:  info.parameterOIDs,
+			ChannelOIDs:    info.channelOIDs,
+			SourceIDs:      info.sourceIDs,
+			FlowIDs:        info.flowIDs,
+			SenderIDs:      info.senderIDs,
+		}
+		if err := g.db.UpsertShureDevice(shureDev); err != nil {
+			slog.Warn("Failed to store Shure device in database", "address", addr, "error", err)
+		}
 	}
 }
 
@@ -755,6 +785,13 @@ func (g *gatewayImpl) Stop(ctx context.Context) error {
 	}
 	slog.Info("NMOS controller stopped")
 
+	// Close database
+	if g.db != nil {
+		slog.Info("Closing database")
+		if err := g.db.Close(); err != nil {
+			slog.Error("Error closing database", "error", err)
+		}
+	}
 	slog.Info("Gateway Stop complete")
 
 	return nil
@@ -823,10 +860,10 @@ func (g *gatewayImpl) ensureIS07Resources(info *shureDeviceInfo, channel int, pa
 		info.senderIDs[channel] = make(map[string]string)
 	}
 
-	// Generate IDs
-	sourceID := uuid.New().String()
-	flowID := uuid.New().String()
-	senderID := uuid.New().String()
+	// Generate IDs - deterministic based on deviceID, channel, and param
+	sourceID := infrastructure.DeriveUUID(fmt.Sprintf("source-%s-%d-%s", deviceID, channel, param))
+	flowID := infrastructure.DeriveUUID(fmt.Sprintf("flow-%s-%d-%s", deviceID, channel, param))
+	senderID := infrastructure.DeriveUUID(fmt.Sprintf("sender-%s-%d-%s", deviceID, channel, param))
 
 	// Store the IDs
 	info.sourceIDs[channel][param] = sourceID
@@ -867,6 +904,7 @@ func (g *gatewayImpl) ensureIS07Resources(info *shureDeviceInfo, channel int, pa
 	})
 
 	// Register Sender (IS-04) with IS-05/IS-07 transport parameters
+	interfaceName := g.nmosCtrl.GetPrimaryInterfaceName()
 	g.nmosCtrl.RegisterResource("senders", map[string]interface{}{
 		"id":                 senderID,
 		"version":            fmt.Sprintf("%d:%d", time.Now().Unix(), time.Now().Nanosecond()),
@@ -875,7 +913,7 @@ func (g *gatewayImpl) ensureIS07Resources(info *shureDeviceInfo, channel int, pa
 		"device_id":          deviceID,
 		"flow_id":            flowID,
 		"transport":          "urn:x-nmos:transport:websocket",
-		"interface_bindings": []string{"eth0"},
+		"interface_bindings": []string{interfaceName},
 		"manifest_href":      nil,
 		"tags": map[string]interface{}{
 			"ext_is_07_source_id":    []string{sourceID},
@@ -1176,6 +1214,12 @@ func (g *gatewayImpl) handleShureDevice(msg infrastructure.Message) {
 
 		if report.Param == "DEVICE_ID" {
 			res["label"] = report.Value
+			g.nmosCtrl.UpdateResourceInRegistry("devices", deviceID, func(r interface{}) interface{} {
+				if res, ok := r.(map[string]interface{}); ok {
+					res["label"] = report.Value
+				}
+				return r
+			})
 		}
 
 		// Update tags for visibility

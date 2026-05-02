@@ -23,8 +23,11 @@ type Message struct {
 type MessageType string
 
 const (
-	ShureDeviceMsg MessageType = "shure_device"
-	NMOSNodeMsg    MessageType = "nmos_node"
+	ShureDeviceMsg    MessageType = "shure_device"
+	NMOSNodeMsg       MessageType = "nmos_node"
+	IS07EventMsg      MessageType = "is07_event"
+	NCPPropertyMsg    MessageType = "ncp_property"
+	ResourceUpdateMsg MessageType = "resource_update"
 )
 
 // InMemoryMessageBus is a simple in-memory implementation of MessageBus

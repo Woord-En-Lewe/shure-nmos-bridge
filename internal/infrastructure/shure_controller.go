@@ -19,6 +19,8 @@ type NMOSController interface {
 	RegisterNode(node interface{}) error
 	RegisterResource(resourceType string, resource interface{}) error
 	UpdateResource(resourceType string, id string, updateFn func(interface{}) interface{}) error
+	SetDatabase(db Database)
+	GetDatabase() Database
 	SetControls(deviceID string, controls []map[string]interface{})
 	GetControls(deviceID string) []map[string]interface{}
 	RegisterNCPObject(oid int, obj NcObject)
@@ -29,6 +31,8 @@ type NMOSController interface {
 	GetNodeID() string
 	GetListenAddr() string
 	SetAdvertisedAddr(addr string)
+	GetPrimaryInterfaceName() string
 	BroadcastEvent(sourceID string, flowID string, eventType string, data interface{})
 	OnControlChange(callback func(deviceID, controlID string, value interface{}))
+	UpdateResourceInRegistry(resourceType string, id string, updateFn func(interface{}) interface{}) error
 }
